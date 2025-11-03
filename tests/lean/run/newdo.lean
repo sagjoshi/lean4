@@ -162,7 +162,7 @@ syntax (name := dooTry) "try " dooSeq (dooCatch)* (dooFinally)? : dooElem
 
 meta def dooInvariant := leading_parser
   "invariant " >> withPosition (
-    ppGroup (many1 (ppSpace >> termParser) >> unicodeSymbol " ↦" " =>" (preserveForPP := true)) >> ppSpace >> withForbidden "doo" termParser)
+    ppGroup (many1 (ppSpace >> termParser argPrec) >> unicodeSymbol " ↦" " =>" (preserveForPP := true)) >> ppSpace >> withForbidden "doo" termParser)
 syntax (name := dooForInvariant) "for " dooForDecl ppSpace dooInvariant "doo " dooSeq : dooElem
 
 @[dooElem_parser]
@@ -1006,7 +1006,7 @@ mutual
       return app
     | `(dooElem| for $x:ident in $xs $inv:dooInvariant doo $dooSeq) =>
       --trace[Elab.do] "cursorBinder: {cursorBinder}"
-      let `(dooInvariant| invariant $cursorBinder => $body) := inv | throwUnsupportedSyntax
+      let `(dooInvariant| invariant $cursorBinder $[$stateBinders]* => $body) := inv | throwUnsupportedSyntax
       let call ← elabElem (← `(dooElem| for $x:ident in $xs doo $dooSeq)) k
       let_expr Foldable.forBreak_ ρ α _ _ _ σ _ _ xs s _ _ _ := call
         | throwError "Internal elaboration error: `for` loop did not elaborate to a call of `Foldable.forBreak_`."
@@ -1025,7 +1025,9 @@ mutual
       let assertion := mkApp (mkConst ``Std.Do.Assertion [w]) ps
       let mutVarsTuple ← Term.exprToSyntax s
       let cursorσ := mkApp2 (mkConst ``Prod [v, v]) cursor σ
-      let success ← Term.elabFun (← `(fun ($cursorBinder, $mutVarsTuple) => $body)) (← mkArrow cursorσ assertion)
+      let syn ← `(fun ($cursorBinder, $mutVarsTuple) $stateBinders* => $body)
+      logInfo m!"cursorσ: {cursorσ}, ps: {ps}, instWP: {instWP}, syn: {syn}"
+      let success ← Term.elabFun (← `(fun ($cursorBinder, $mutVarsTuple) $stateBinders* => $body)) (← mkArrow cursorσ assertion)
       let inv := mkApp3 (mkConst ``Std.Do.PostCond.noThrow [w]) ps cursorσ success
       return mkApp4 (mkAppN head args) instFoldable ps instWP inv
 -- Why doesn't the following work?
@@ -1181,6 +1183,22 @@ set_option trace.Elab.do true in
   let mut z := 1
   for i in [1,2,3]
     invariant xs => ⌜xs.pos = 3⌝ doo
+    x := x + i
+    for j in [i:10].toList doo
+      if j < 5 then z := z + j
+      if j > 8 then return 42
+      if j < 3 then continue
+      if j > 6 then break
+      z := z + i
+  return x + y + z
+
+open Std.Do in
+#check Id.run <| StateT.run (σ:= Nat) (s:=42) doo
+  let mut x := 42
+  let mut y := 0
+  let mut z := 1
+  for i in [1,2,3]
+    invariant xs s => ⌜xs.pos = s⌝ doo
     x := x + i
     for j in [i:10].toList doo
       if j < 5 then z := z + j
