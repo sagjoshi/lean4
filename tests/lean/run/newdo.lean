@@ -161,8 +161,9 @@ syntax (name := dooTry) "try " dooSeq (dooCatch)* (dooFinally)? : dooElem
 --   "try " >> dooSeq >> many dooCatch >> optional dooFinally
 
 meta def dooInvariant := leading_parser
-  "invariant " >> withPosition Term.basicFun
-syntax (name := dooForInvariant) "for " dooForDecl dooInvariant "doo " dooSeq : dooElem
+  "invariant " >> withPosition (
+    ppGroup (many1 (ppSpace >> termParser) >> unicodeSymbol " ↦" " =>" (preserveForPP := true)) >> ppSpace >> withForbidden "doo" termParser)
+syntax (name := dooForInvariant) "for " dooForDecl ppSpace dooInvariant "doo " dooSeq : dooElem
 
 @[dooElem_parser]
 meta def dooReassign      := leading_parser
@@ -316,6 +317,16 @@ Information about a `ContVarId`.
 structure ContVarInfo where
   /-- The monadic type of the continuation. -/
   type : Expr
+  /--
+  A superset of the `let`-bound local variable names that the jumps will refer to.
+  Often the `mut` variables.
+  Any `let`-bound var will be turned into a `have` by setting their `nondep` flag in the local
+  context of the metavariable for the jump site. This is a technicality to ensure that `isDefEq`
+  will not inline the `let`s.
+  -/
+  letToHaveVars : Std.HashSet Name
+  /-- Local context at the time the continuation variable was created. -/
+  lctx : LocalContext
   /-- The tracked jumps to the continuation. Each contains a metavariable to be assigned later. -/
   jumps : Array ContVarJump
 
@@ -410,7 +421,7 @@ meta def declareMutVar? (mutTk? : Option Syntax) (x : Name) (k : DoElabM α) : D
 /-- Throw an error if the given name is not a declared `mut` variable. -/
 meta def throwUnlessMutVarDeclared (x : Name) : DoElabM Unit := do
   unless (← read).mutVars.contains x do
-    throwError "mutable variable `{x}` is not declared"
+    throwError "undeclared mutable variable `{x}`"
 
 /-- Throw an error if a declaration of the given name would shadow a `mut` variable. -/
 meta def checkMutVarsForShadowing (x : Name) : DoElabM Unit := do
@@ -478,12 +489,36 @@ meta def getReassignedMutVars (rootCtx : LocalContext) (childCtxs : Array LocalC
     reassignedMutVars := reassignedMutVars.insertMany (filterReassigned mutVars rootCtx childCtx)
   return mutVars.filter reassignedMutVars.contains
 
-/-- Creates a new continuation variable of type `m α` given the result type `α`. -/
-meta def mkFreshContVar (resultType : Expr) : DoElabM ContVarId := do
+meta def _root_.Lean.LocalContext.findFromUserNames (lctx : LocalContext) (userNames : Std.HashSet Name) (start := 0) : Array LocalDecl :=
+  Array.reverse <| Id.run <| ExceptT.runCatch do
+    let (_, _, acc) ← lctx.foldrM (init := (userNames, lctx.numIndices - 1, #[])) fun decl (userNames, i, acc) => do
+      if userNames.isEmpty then throw acc -- stop when we found all user names
+      if i < start then throw acc         -- stop when we reached the start index
+      if userNames.contains decl.userName then
+        pure (userNames.erase decl.userName, i - 1, acc.push decl)
+      else
+        pure (userNames, i - 1, acc)
+    return acc
+
+meta def addVarDefsAsNonDep (tunneledVars : Std.HashSet Name) (rootCtx childCtx : LocalContext) : LocalContext := Id.run do
+  let tunnelDecls := childCtx.findFromUserNames tunneledVars (start := rootCtx.numIndices)
+  let mut rootCtx := rootCtx
+  for decl in tunnelDecls do
+    rootCtx := rootCtx.addDecl (decl.setNondep true)
+  return rootCtx
+
+/--
+Creates a new continuation variable of type `m α` given the result type `α`.
+The `letToHaveVars` is a superset of the `let`-bound variable names that the jumps will refer to.
+Often it will be the `mut` variables. Leaving it empty inlines `let`-bound variables at jump sites.
+-/
+meta def mkFreshContVar (resultType : Expr) (letToHaveVars : Array Name) : DoElabM ContVarId := do
   let name ← mkFreshId
   let contVarId := ContVarId.mk name
   let type ← mkMonadicType resultType
-  modify fun s => { s with contVars := s.contVars.insert contVarId { type, jumps := #[] } }
+  let letToHaveVars := Std.HashSet.ofArray letToHaveVars
+  let cvInfo := { type, jumps := #[], lctx := (← getLCtx), letToHaveVars }
+  modify fun s => { s with contVars := s.contVars.insert contVarId cvInfo }
   return contVarId
 
 meta def ContVarId.find (contVarId : ContVarId) : DoElabM ContVarInfo := do
@@ -494,7 +529,8 @@ meta def ContVarId.find (contVarId : ContVarId) : DoElabM ContVarInfo := do
 /-- Creates a new jump site for the continuation variable, to be synthesized later. -/
 meta def ContVarId.mkJump (contVarId : ContVarId) : DoElabM Expr := do
   let info ← contVarId.find
-  let mvar ← mkFreshExprMVar info.type
+  let lctx := addVarDefsAsNonDep info.letToHaveVars info.lctx (← getLCtx)
+  let mvar ← withLCtx' lctx (mkFreshExprMVar info.type)
   let jumps := info.jumps.push { mvar, ref := (← getRef) }
   modify fun s => { s with contVars := s.contVars.insert contVarId { info with jumps } }
   return mvar
@@ -670,11 +706,9 @@ meta def DoElemCont.withDuplicableCont (dec : DoElemCont) (caller : DoElemCont �
   let joinTy ← mkFreshExprMVar (mkSort (mkLevelSucc (← read).monadInfo.v)) (userName := `joinTy)
   let joinRhs ← mkFreshExprMVar joinTy (userName := `joinRhs)
   withLetDecl (← mkFreshUserName `__do_jp) joinTy joinRhs (kind := .implDetail) fun jp => do
-    let lctx ← getLCtx
     let mutVars := (← read).mutVars
-    let contVarId ← mkFreshContVar α
+    let contVarId ← mkFreshContVar α (mutVars.push rName)
     let duplicableDec := DoElemCont.cont rName resultType contVarId.mkJump
-      |>.withRestoredLCtxAndMutVarDefs lctx mutVars
     let e ← caller duplicableDec
 
     -- Now determine whether we need to realize the join point.
@@ -914,8 +948,8 @@ mutual
 
           -- We need to delay filling in continueK and breakK because they take a `σ` tuple
           let loopBodyCtx ← getLCtx
-          let continueK ← mkFreshContVar eoσ
-          let breakK ← mkFreshContVar eoσ
+          let continueK ← mkFreshContVar eoσ mutVars
+          let breakK ← mkFreshContVar eoσ mutVars
           let returnK (e : Expr) : DoElabM Expr := do
             -- We can fill in `returnK` now because it does not depend on `σ`
             let e ← Term.ensureHasType ε e
@@ -970,8 +1004,9 @@ mutual
       let app := mkApp5 app ρ α instFoldable mi.m instMonad
       let app := mkApp8 app σ ε γ xs preS body kreturn kafter
       return app
-    | `(dooElem| for $x:ident in $xs invariant $binders* => $body
-                 doo $dooSeq) =>
+    | `(dooElem| for $x:ident in $xs $inv:dooInvariant doo $dooSeq) =>
+      --trace[Elab.do] "cursorBinder: {cursorBinder}"
+      let `(dooInvariant| invariant $cursorBinder => $body) := inv | throwUnsupportedSyntax
       let call ← elabElem (← `(dooElem| for $x:ident in $xs doo $dooSeq)) k
       let_expr Foldable.forBreak_ ρ α _ _ _ σ _ _ xs s _ _ _ := call
         | throwError "Internal elaboration error: `for` loop did not elaborate to a call of `Foldable.forBreak_`."
@@ -984,20 +1019,14 @@ mutual
       let instFoldable ← Term.mkInstMVar (mkApp2 (mkConst ``Foldable [u, v, v]) ρ α)
       let ps ← mkFreshExprMVar (mkConst ``Std.Do.PostShape [w])
       let instWP ← Term.mkInstMVar (mkApp2 (mkConst ``Std.Do.WP [w, x]) (← read).monadInfo.m ps)
-      let xsToList := mkApp4 (mkConst ``Foldable.toList [u, v, v]) ρ α instFoldable xs
+      let xsToList := mkApp4 (mkConst ``Foldable.toList [u, v]) ρ α instFoldable xs
       let inv ← mkFreshExprMVar (mkApp4 (mkConst ``Std.Do.Invariant [v, v]) α xsToList σ ps)
-      -- let cursor := mkApp2 (mkConst ``List.Cursor [v]) α xsToList
-      -- let assertion := mkApp (mkConst ``Std.Do.Assertion [w]) ps
-      -- let (binders, body, _) ← liftMacroM <| Term.expandFunBinders ody
-      -- let success ← Term.elabFunBinders binders (← mkArrow cursor assertion) fun bs expectedType? => do
-      --   /- We ensure the expectedType here since it will force coercions to be applied if needed.
-      --       If we just use `elabTerm`, then we will need to a coercion `Coe (α → β) (α → δ)` whenever there is a coercion `Coe β δ`,
-      --       and another instance for the dependent version. -/
-      --   let e ← elabTermEnsuringType body expectedType?
-      --   let #[b,bs] := bs | unreachable!
-      --   mkLambdaFVars xs e
-      -- let success ← Term.elabFun (← `(fun $inv:basicFun)) (← mkArrow cursor assertion)
-      -- let inv := mkApp (mkConst ``Std.Do.PostCond.noThrow [w] ps cursor success)
+      let cursor := mkApp2 (mkConst ``List.Cursor [v]) α xsToList
+      let assertion := mkApp (mkConst ``Std.Do.Assertion [w]) ps
+      let mutVarsTuple ← Term.exprToSyntax s
+      let cursorσ := mkApp2 (mkConst ``Prod [v, v]) cursor σ
+      let success ← Term.elabFun (← `(fun ($cursorBinder, $mutVarsTuple) => $body)) (← mkArrow cursorσ assertion)
+      let inv := mkApp3 (mkConst ``Std.Do.PostCond.noThrow [w]) ps cursorσ success
       return mkApp4 (mkAppN head args) instFoldable ps instWP inv
 -- Why doesn't the following work?
 --    | `(dooElem| try $trySeq:dooSeq $[$catchSeqs:dooCatch]* $[finally $finSeq?]?) =>
@@ -1016,8 +1045,8 @@ mutual
       let mi := (← read).monadInfo
       let α := k.resultType
       let ασ ← mkFreshExprMVar (mkSort (mkLevelSucc mi.u)) (userName := `ασ)
-      let pureKVar ← mkFreshContVar ασ
       let rName ← mkFreshUserName `r
+      let pureKVar ← mkFreshContVar ασ ((← read).mutVars.push rName)
       let pureK := DoElemCont.cont rName α pureKVar.mkJump
       let body ← elabElems1 (getDooElems trySeq) pureK
       let body ← xs.zip (eTypes?.zip catchSeqs) |>.foldlM (init := body) fun body (x, eType?, catchSeq) => do
@@ -1079,11 +1108,11 @@ mutual
 end
 
 meta def elabDooBlock (dooSeq : TSyntax `dooSeq) (expectedType? : Expr) : TermElabM Expr := do
-  trace[Elab.do] "Doo block: {toString dooSeq}, expectedType?: {expectedType?}"
   Term.tryPostponeIfNoneOrMVar expectedType?
   let ctx ← mkContext expectedType?
   let res ← elabElems1 (getDooElems dooSeq) (.last ctx.doBlockResultType) |>.run ctx |>.run' {}
   -- logInfo m!"res: {res}"
+  trace[Elab.do] "{res}"
   pure res
 
 elab_rules : term <= expectedType?
@@ -1095,10 +1124,10 @@ set_option pp.raw false in
   let mut x ← pure 42
   let y ←
     if true then
-      pure ()
+      pure 42
     else
-      pure ()
-  x := x + 3
+      pure 31
+  x := x + y
   return x
 set_option pp.mvars.delayed false in
 set_option trace.Meta.synthInstance true in
@@ -1132,6 +1161,35 @@ example (x : Option PEmpty) : Nat :=
   match x with
   | none => 0
 
+set_option trace.Elab.do true in
+#check Id.run doo
+  let mut x := 42
+  let mut y := 0
+  let mut z := 1
+  for i in [1,2,3] doo
+    x := x + i
+    for j in [i:10].toList doo
+      if j < 5 then z := z + j
+      z := z + i
+  return x + y + z
+
+open Std.Do in
+set_option trace.Elab.do true in
+#check Id.run doo
+  let mut x := 42
+  let mut y := 0
+  let mut z := 1
+  for i in [1,2,3]
+    invariant xs => ⌜xs.pos = 3⌝ doo
+    x := x + i
+    for j in [i:10].toList doo
+      if j < 5 then z := z + j
+      if j > 8 then return 42
+      if j < 3 then continue
+      if j > 6 then break
+      z := z + i
+  return x + y + z
+
 /--
 info: (let x := 42;
   let y := 0;
@@ -1142,8 +1200,8 @@ info: (let x := 42;
       let z := s.snd;
       let x_1 := x + i;
       let __do_jp := fun z r =>
-        let z_1 := z + i;
-        BreakT.continue (x + i, z + i);
+        let z := z + i;
+        BreakT.continue (x_1, z);
       if x_1 > 10 then
         let z := z + i;
         __do_jp z PUnit.unit
@@ -1181,13 +1239,15 @@ info: (let w := 23;
       let z := s.snd;
       let __do_jp := fun z r =>
         if x > 10 then
-          let x_1 := x + 3;
-          BreakT.continue (x + 3, y, z)
+          let x := x + 3;
+          BreakT.continue (x, y, z)
         else
           if x < 20 then
-            let y_1 := y - 2;
-            BreakT.break (x, y - 2, z)
-          else BreakT.continue (x + i, y, z);
+            let y := y - 2;
+            BreakT.break (x, y, z)
+          else
+            let x := x + i;
+            BreakT.continue (x, y, z);
       if x = 3 then
         let z := z + i;
         __do_jp z PUnit.unit
@@ -1252,51 +1312,51 @@ trace: [Compiler.saveBase] size: 68
             let _x.28 := Nat.decLt x _x.27;
             cases _x.28 : Except Nat (Option PUnit × Nat × Nat × Nat)
             | Decidable.isFalse x.29 =>
-              let _x.30 := Nat.add x a;
-              let _x.31 := @Prod.mk _ _ y z;
-              let _x.32 := @Prod.mk _ _ _x.30 _x.31;
-              let _x.33 := PUnit.unit;
-              let _x.34 := @some _ _x.33;
-              let _x.35 := @Prod.mk _ _ _x.34 _x.32;
-              let _x.36 := @Except.ok _ _ _x.35;
-              return _x.36
-            | Decidable.isTrue x.37 =>
+              let x := Nat.add x a;
+              let _x.30 := @Prod.mk _ _ y z;
+              let _x.31 := @Prod.mk _ _ x _x.30;
+              let _x.32 := PUnit.unit;
+              let _x.33 := @some _ _x.32;
+              let _x.34 := @Prod.mk _ _ _x.33 _x.31;
+              let _x.35 := @Except.ok _ _ _x.34;
+              return _x.35
+            | Decidable.isTrue x.36 =>
               let y := Nat.sub y _x.1;
-              let _x.38 := @Prod.mk _ _ y z;
-              let _x.39 := @Prod.mk _ _ x _x.38;
-              let _x.40 := @none _;
-              let _x.41 := @Prod.mk _ _ _x.40 _x.39;
-              let _x.42 := @Except.ok _ _ _x.41;
-              return _x.42
-          | Decidable.isTrue x.43 =>
+              let _x.37 := @Prod.mk _ _ y z;
+              let _x.38 := @Prod.mk _ _ x _x.37;
+              let _x.39 := @none _;
+              let _x.40 := @Prod.mk _ _ _x.39 _x.38;
+              let _x.41 := @Except.ok _ _ _x.40;
+              return _x.41
+          | Decidable.isTrue x.42 =>
             let x := Nat.add x _x.2;
-            let _x.44 := @Prod.mk _ _ y z;
-            let _x.45 := @Prod.mk _ _ x _x.44;
-            let _x.46 := PUnit.unit;
-            let _x.47 := @some _ _x.46;
-            let _x.48 := @Prod.mk _ _ _x.47 _x.45;
-            let _x.49 := @Except.ok _ _ _x.48;
-            return _x.49;
+            let _x.43 := @Prod.mk _ _ y z;
+            let _x.44 := @Prod.mk _ _ x _x.43;
+            let _x.45 := PUnit.unit;
+            let _x.46 := @some _ _x.45;
+            let _x.47 := @Prod.mk _ _ _x.46 _x.44;
+            let _x.48 := @Except.ok _ _ _x.47;
+            return _x.48;
         let z := s.21 # 1;
-        let _x.50 := instDecidableEqNat x _x.2;
-        cases _x.50 : Nat
-        | Decidable.isFalse x.51 =>
-          let _x.52 := PUnit.unit;
-          let _x.53 := _f.22 z _x.52;
-          goto _jp.12 _x.53
-        | Decidable.isTrue x.54 =>
+        let _x.49 := instDecidableEqNat x _x.2;
+        cases _x.49 : Nat
+        | Decidable.isFalse x.50 =>
+          let _x.51 := PUnit.unit;
+          let _x.52 := _f.22 z _x.51;
+          goto _jp.12 _x.52
+        | Decidable.isTrue x.53 =>
           let z := Nat.add z a;
-          let _x.55 := PUnit.unit;
-          let _x.56 := _f.22 z _x.55;
-          goto _jp.12 _x.56;
+          let _x.54 := PUnit.unit;
+          let _x.55 := _f.22 z _x.54;
+          goto _jp.12 _x.55;
       cases x.3 : Nat
       | List.nil =>
-        let _x.57 := _f.5 _y.4;
-        return _x.57
-      | List.cons head.58 tail.59 =>
-        let _x.60 := @List.foldrNonTR _ _ _f.11 _f.5 tail.59;
-        let _x.61 := _f.11 head.58 _x.60 _y.4;
-        return _x.61
+        let _x.56 := _f.5 _y.4;
+        return _x.56
+      | List.cons head.57 tail.58 =>
+        let _x.59 := @List.foldrNonTR _ _ _f.11 _f.5 tail.58;
+        let _x.60 := _f.11 head.57 _x.59 _y.4;
+        return _x.60
 [Compiler.saveBase] size: 13
     def Do._example : Nat :=
       let w := 23;
@@ -1382,8 +1442,33 @@ info: (let w := 23;
     x := x + i
   return w + x + y + z)
 
+set_option trace.Elab.do true in
 set_option trace.Compiler.saveBase true in
 /--
+trace: [Elab.do] let x := 42;
+    Foldable.forBreak_ [1, 2, 3] x
+      (fun i s =>
+        let x := s;
+        if x = 3 then EarlyReturnT.return x
+        else
+          if x > 10 then
+            let x := x + 3;
+            BreakT.continue x
+          else
+            if x < 20 then
+              let x := x * 2;
+              BreakT.break x
+            else
+              let x := x + i;
+              BreakT.continue x)
+      (fun r => pure r) fun s =>
+      let x := s;
+      let x := x + 13;
+      let x := x + 13;
+      let x := x + 13;
+      let x := x + 13;
+      pure x
+---
 trace: [Compiler.saveBase] size: 29
     def List.foldrNonTR._at_.Do._example.spec_0 _x.1 _x.2 x.3 _y.4 : Nat :=
       fun _f.5 s.6 : Nat :=
@@ -1409,18 +1494,18 @@ trace: [Compiler.saveBase] size: 29
             let _x.17 := Nat.decLt _y.4 _x.16;
             cases _x.17 : Nat
             | Decidable.isFalse x.18 =>
-              let _x.19 := Nat.add _y.4 head.9;
-              let _x.20 := List.foldrNonTR._at_.Do._example.spec_0 _x.1 _x.2 tail.10 _x.19;
-              return _x.20
-            | Decidable.isTrue x.21 =>
+              let x := Nat.add _y.4 head.9;
+              let _x.19 := List.foldrNonTR._at_.Do._example.spec_0 _x.1 _x.2 tail.10 x;
+              return _x.19
+            | Decidable.isTrue x.20 =>
               let x := Nat.mul _y.4 _x.2;
-              let _x.22 := _f.5 x;
-              return _x.22
-          | Decidable.isTrue x.23 =>
+              let _x.21 := _f.5 x;
+              return _x.21
+          | Decidable.isTrue x.22 =>
             let x := Nat.add _y.4 _x.1;
-            let _x.24 := List.foldrNonTR._at_.Do._example.spec_0 _x.1 _x.2 tail.10 x;
-            return _x.24
-        | Decidable.isTrue x.25 =>
+            let _x.23 := List.foldrNonTR._at_.Do._example.spec_0 _x.1 _x.2 tail.10 x;
+            return _x.23
+        | Decidable.isTrue x.24 =>
           return _y.4
 [Compiler.saveBase] size: 9
     def Do._example : Nat :=
@@ -1449,146 +1534,160 @@ example := Id.run doo
   x := x + 13
   return x
 
-set_option trace.Compiler.specialize.candidate true in
+set_option trace.Compiler.saveBase true in
 /--
-trace: [Compiler.specialize.candidate] List.foldrNonTR _f.582 _f.102 _x.21 _x.22, [N, N, U, U, O]
-[Compiler.specialize.candidate] key: fun _x.15 x z =>
-      List.foldrNonTR
-        (fun a acc s =>
-          have x_1 := s.1;
-          have z_1 := s.2;
-          have x_2 := x_1.add a;
-          have _f.713 := fun s.714 =>
-            have _x.715 := (x_2, s.714);
-            have _x.716 := PUnit.unit;
-            have _x.717 := some _x.716;
-            have _x.718 := (_x.717, _x.715);
-            have _x.719 := Except.ok _x.718;
-            _x.719;
-          have _f.720 := fun a_1 acc s =>
-            have _jp.766 := fun _y.765 =>
-              cases _y.765
-                (Except.error fun a.722 =>
-                  have _x.723 := Except.error a.722;
-                  _x.723)
-                (Except.ok fun a.724 =>
-                  cases a.724
-                    (Prod.mk fun fst.725 snd.726 =>
-                      cases fst.725
-                        (none
-                          (have _x.727 := _f.713 snd.726;
-                          _x.727))
-                        (some fun val.728 =>
-                          have _x.729 := acc snd.726;
-                          _x.729)));
-            have _f.731 := fun z r.732 =>
-              have _x.733 := 8;
-              have _x.734 := _x.733.decLt a_1;
-              cases _x.734 isFalse isTrue;
-            have _x.757 := 5;
-            have _x.758 := a_1.decLt _x.757;
-            cases _x.758 isFalse isTrue;
-          have _x.667 := 10;
-          have _x.668 := _x.667.sub a;
-          have _x.669 := _x.668.add z;
-          have _x.670 := 1;
-          have _x.671 := _x.669.sub _x.670;
-          have _x.673 := z.mul _x.671;
-          have _x.674 := a.add _x.673;
-          have _x.675 := [];
-          have _x.676 := List.range'TR.go z _x.671 _x.674 _x.675;
-          have _x.730 := List.foldrNonTR _f.720 _f.713 _x.676 z_1;
-          cases _x.730 (Except.error fun a.660 => a.660)
-            (Except.ok fun a.661 =>
-              cases a.661
-                (Prod.mk fun fst.662 snd.663 =>
-                  cases fst.662
-                    (none
-                      (have _x.664 :=
-                        (fun s.90 =>
-                            have x := s.90.1;
-                            have z := s.90.2;
-                            have _x.577 := x.add z;
-                            _x.577)
-                          snd.663;
-                      _x.664))
-                    (some fun val.665 =>
-                      have _x.666 := acc snd.663;
-                      _x.666))))
-        fun s.90 =>
-        have x := s.90.1;
-        have z := s.90.2;
-        have _x.577 := x.add z;
-        _x.577
-[Compiler.specialize.candidate] List.foldrNonTR _f.776 _f.773 tail.848, [N, N, U, U, O]
-[Compiler.specialize.candidate] key: fun _x.772 x z =>
-      List.foldrNonTR
-        (fun a acc s =>
-          have x_1 := s.1;
-          have z_1 := s.2;
-          have x_2 := x_1.add a;
-          have _f.777 := fun s.778 =>
-            have _x.779 := (x_2, s.778);
-            have _x.780 := PUnit.unit;
-            have _x.781 := some _x.780;
-            have _x.782 := (_x.781, _x.779);
-            have _x.783 := Except.ok _x.782;
-            _x.783;
-          have _f.784 := fun a_1 acc s =>
-            have _jp.785 := fun _y.786 =>
-              cases _y.786
-                (Except.error fun a.787 =>
-                  have _x.788 := Except.error a.787;
-                  _x.788)
-                (Except.ok fun a.789 =>
-                  cases a.789
-                    (Prod.mk fun fst.790 snd.791 =>
-                      cases fst.790
-                        (none
-                          (have _x.792 := _f.777 snd.791;
-                          _x.792))
-                        (some fun val.793 =>
-                          have _x.794 := acc snd.791;
-                          _x.794)));
-            have _f.795 := fun z r.796 =>
-              have _x.797 := 8;
-              have _x.798 := _x.797.decLt a_1;
-              cases _x.798 isFalse isTrue;
-            have _x.821 := 5;
-            have _x.822 := a_1.decLt _x.821;
-            cases _x.822 isFalse isTrue;
-          have _x.829 := 10;
-          have _x.830 := _x.829.sub a;
-          have _x.831 := _x.830.add z;
-          have _x.832 := 1;
-          have _x.833 := _x.831.sub _x.832;
-          have _x.834 := z.mul _x.833;
-          have _x.835 := a.add _x.834;
-          have _x.836 := [];
-          have _x.837 := List.range'TR.go z _x.833 _x.835 _x.836;
-          have _x.838 := List.foldrNonTR _f.784 _f.777 _x.837 z_1;
-          cases _x.838 (Except.error fun a.839 => a.839)
-            (Except.ok fun a.840 =>
-              cases a.840
-                (Prod.mk fun fst.841 snd.842 =>
-                  cases fst.841
-                    (none
-                      (have _x.843 :=
-                        (fun s.774 =>
-                            have x := s.774.1;
-                            have z := s.774.2;
-                            have _x.775 := x.add z;
-                            _x.775)
-                          snd.842;
-                      _x.843))
-                    (some fun val.844 =>
-                      have _x.845 := acc snd.842;
-                      _x.845))))
-        fun s.774 =>
-        have x := s.774.1;
-        have z := s.774.2;
-        have _x.775 := x.add z;
-        _x.775
+trace: [Compiler.saveBase] size: 29
+    def List.foldrNonTR._at_.Do._example.spec_0 _x.1 _x.2 x.3 _y.4 : Nat :=
+      fun _f.5 s.6 : Nat :=
+        let _x.7 := 13;
+        let x := Nat.add s.6 _x.7;
+        let x := Nat.add x _x.7;
+        let x := Nat.add x _x.7;
+        let x := Nat.add x _x.7;
+        return x;
+      cases x.3 : Nat
+      | List.nil =>
+        let _x.8 := _f.5 _y.4;
+        return _x.8
+      | List.cons head.9 tail.10 =>
+        let _x.11 := instDecidableEqNat _y.4 _x.1;
+        cases _x.11 : Nat
+        | Decidable.isFalse x.12 =>
+          let _x.13 := 10;
+          let _x.14 := Nat.decLt _x.13 _y.4;
+          cases _x.14 : Nat
+          | Decidable.isFalse x.15 =>
+            let _x.16 := 20;
+            let _x.17 := Nat.decLt _y.4 _x.16;
+            cases _x.17 : Nat
+            | Decidable.isFalse x.18 =>
+              let x := Nat.add _y.4 head.9;
+              let _x.19 := List.foldrNonTR._at_.Do._example.spec_0 _x.1 _x.2 tail.10 x;
+              return _x.19
+            | Decidable.isTrue x.20 =>
+              let x := Nat.mul _y.4 _x.2;
+              let _x.21 := _f.5 x;
+              return _x.21
+          | Decidable.isTrue x.22 =>
+            let x := Nat.add _y.4 _x.1;
+            let _x.23 := List.foldrNonTR._at_.Do._example.spec_0 _x.1 _x.2 tail.10 x;
+            return _x.23
+        | Decidable.isTrue x.24 =>
+          return _y.4
+[Compiler.saveBase] size: 9
+    def Do._example : Nat :=
+      let x := 42;
+      let _x.1 := 1;
+      let _x.2 := 2;
+      let _x.3 := 3;
+      let _x.4 := @List.nil _;
+      let _x.5 := @List.cons _ _x.3 _x.4;
+      let _x.6 := @List.cons _ _x.2 _x.5;
+      let _x.7 := @List.cons _ _x.1 _x.6;
+      let _x.8 := List.foldrNonTR._at_.Do._example.spec_0 _x.3 _x.2 _x.7 x;
+      return _x.8
+-/
+#guard_msgs in
+example := Id.run doo
+  let mut x := 42
+  for i in [1,2,3] doo
+    if x = 3 then return x
+    if x > 10 then x := x + 3; continue
+    if x < 20 then x := x * 2; break
+    x := x + i
+  x := x + 13
+  x := x + 13
+  x := x + 13
+  x := x + 13
+  return x
+
+set_option trace.Elab.do true in
+set_option trace.Compiler.saveBase true in
+/--
+trace: [Elab.do] let x := 42;
+    let y := 0;
+    let z := 1;
+    Foldable.forBreak_ [1, 2, 3] (x, z)
+      (fun i s =>
+        let x := s.fst;
+        let z := s.snd;
+        let x_1 := x + i;
+        Foldable.forBreak_ [i:10].toList z
+          (fun j s_1 =>
+            let z_1 := s_1;
+            let z := z_1 + x_1 + j;
+            BreakT.continue z)
+          (fun r => EarlyReturnT.return r) fun s =>
+          let z := s;
+          BreakT.continue (x_1, z))
+      (fun r => pure r) fun s =>
+      let x := s.fst;
+      let z := s.snd;
+      pure (x + y + z)
+---
+trace: [Compiler.saveBase] size: 38
+    def List.foldrNonTR._at_.Do._example.spec_0 z x.1 _y.2 : Nat :=
+      fun _f.3 s.4 : Nat :=
+        let x := s.4 # 0;
+        let z := s.4 # 1;
+        let _x.5 := Nat.add x z;
+        return _x.5;
+      cases x.1 : Nat
+      | List.nil =>
+        let _x.6 := _f.3 _y.2;
+        return _x.6
+      | List.cons head.7 tail.8 =>
+        let x := _y.2 # 0;
+        let z := _y.2 # 1;
+        let x := Nat.add x head.7;
+        fun _f.9 a acc s : Except Nat (Option PUnit × Nat × Nat) :=
+          let _x.10 := Nat.add s x;
+          let z := Nat.add _x.10 a;
+          let _x.11 := acc z;
+          return _x.11;
+        fun _f.12 s.13 : Except Nat (Option PUnit × Nat × Nat) :=
+          let _x.14 := @Prod.mk _ _ x s.13;
+          let _x.15 := PUnit.unit;
+          let _x.16 := @some _ _x.15;
+          let _x.17 := @Prod.mk _ _ _x.16 _x.14;
+          let _x.18 := @Except.ok _ _ _x.17;
+          return _x.18;
+        let _x.19 := 10;
+        let _x.20 := Nat.sub _x.19 head.7;
+        let _x.21 := Nat.add _x.20 z;
+        let _x.22 := 1;
+        let _x.23 := Nat.sub _x.21 _x.22;
+        let _x.24 := Nat.mul z _x.23;
+        let _x.25 := Nat.add head.7 _x.24;
+        let _x.26 := @List.nil _;
+        let _x.27 := List.range'TR.go z _x.23 _x.25 _x.26;
+        let _x.28 := @List.foldrNonTR _ _ _f.9 _f.12 _x.27 z;
+        cases _x.28 : Nat
+        | Except.error a.29 =>
+          return a.29
+        | Except.ok a.30 =>
+          cases a.30 : Nat
+          | Prod.mk fst.31 snd.32 =>
+            cases fst.31 : Nat
+            | Option.none =>
+              let _x.33 := _f.3 snd.32;
+              return _x.33
+            | Option.some val.34 =>
+              let _x.35 := List.foldrNonTR._at_.Do._example.spec_0 z tail.8 snd.32;
+              return _x.35
+[Compiler.saveBase] size: 10
+    def Do._example : Nat :=
+      let x := 42;
+      let z := 1;
+      let _x.1 := 2;
+      let _x.2 := 3;
+      let _x.3 := @List.nil _;
+      let _x.4 := @List.cons _ _x.2 _x.3;
+      let _x.5 := @List.cons _ _x.1 _x.4;
+      let _x.6 := @List.cons _ z _x.5;
+      let _x.7 := @Prod.mk _ _ x z;
+      let _x.8 := List.foldrNonTR._at_.Do._example.spec_0 z _x.6 _x.7;
+      return _x.8
 -/
 #guard_msgs in
 example := Id.run doo
@@ -1598,11 +1697,7 @@ example := Id.run doo
   for i in [1,2,3] doo
     x := x + i
     for j in [i:10].toList doo
-      if j < 5 then z := z + j
-      if j > 8 then return 42
-      if j < 3 then continue
-      if j > 6 then break
-      z := z + i
+      z := z + x + j
   return x + y + z
 
 /--
@@ -1747,10 +1842,8 @@ example : (Id.run doo
 = (Id.run do
   let x ← (do let y := 5; pure (y + 3))
   return x * 2) := by rfl
-#print Eq.casesOn
 
 -- Test: Mutable variable reassignment through monadic bind
-set_option trace.Meta.isDefEq true in
 example : (Id.run doo
   let mut x := 1
   x ← pure (x + 10)
@@ -1957,9 +2050,7 @@ example :
   let mut x := 42
   let mut y := 0
   let mut z := 1
-  for i in [1,2,3]
-    invariant xs => True
-    doo
+  for i in [1,2,3] doo
     x := x + i
     for j in [i:10].toList doo
       if j < 5 then z := z + j
@@ -2156,7 +2247,7 @@ example := (Id.run doo if true then {pure ()} else {pure false}; pure ())
 
 -- Additional error tests
 
-/-- error: unknown local declaration `foo` -/
+/-- error: undeclared mutable variable `foo` -/
 #guard_msgs (error) in
 example := (Id.run doo foo := 42; pure ())
 
@@ -2600,4 +2691,52 @@ def Iterator.step
 
 
 
+-/
+
+/-
+info: (let x := 0;
+  let y := 0;
+  if true = true then
+    let x := x + 3;
+    pure (x + y)
+  else pure 3).run : Nat
+-/
+-- #guard_msgs (info) in
+#check Id.run doo
+  let mut x := 0
+  for i in [1,2,3] doo
+    x := x + 3
+    let y := x + x + x
+    return y
+  return x
+
+#check fun i => Id.run doo
+  let mut x := 0
+  if true then
+    x := x + i
+    let y := x + x + x
+    pure y
+  else
+    x := x + 5
+  return x
+
+
+/-
+let mut x := 0
+let mut y := 0
+if b then
+  x := 3
+else
+  y := 5
+return (x + y)
+
+let mut x := 0
+let mut y := 0
+let jp x y := return (x + y)
+if b then
+  let x := 3
+  jp x y
+else
+  let y := 5
+  jp x y
 -/
