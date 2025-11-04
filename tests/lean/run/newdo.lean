@@ -318,13 +318,12 @@ structure ContVarInfo where
   /-- The monadic type of the continuation. -/
   type : Expr
   /--
-  A superset of the `let`-bound local variable names that the jumps will refer to.
-  Often the `mut` variables.
-  Any `let`-bound var will be turned into a `have` by setting their `nondep` flag in the local
-  context of the metavariable for the jump site. This is a technicality to ensure that `isDefEq`
-  will not inline the `let`s.
+  A superset of the local variable names that the jumps will refer to. Often the `mut` variables.
+  Any `let`-bound FV will be turned into a `have`-bound FV by setting their `nondep` flag in the
+  local context of the metavariable for the jump site. This is a technicality to ensure that
+  `isDefEq` will not inline the `let`s.
   -/
-  letToHaveVars : Std.HashSet Name
+  tunneledVars : Std.HashSet Name
   /-- Local context at the time the continuation variable was created. -/
   lctx : LocalContext
   /-- The tracked jumps to the continuation. Each contains a metavariable to be assigned later. -/
@@ -428,12 +427,6 @@ meta def checkMutVarsForShadowing (x : Name) : DoElabM Unit := do
   if (← read).mutVars.contains x then
     throwError "mutable variable `{x.simpMacroScopes}` cannot be shadowed"
 
-/-- Has the effect of ``let x : ty := rhs; $(← k `(x))``. -/
-meta def mkLetThen (x : Name) (ty : Expr) (rhs : Expr) (k : Expr → DoElabM Expr) : DoElabM Expr := do
-  withLetDecl x ty rhs fun x => do
-    let e ← k x
-    mkLetFVars (usedLetOnly := false) #[x] e
-
 /-- Create a fresh `α` that would fit in `m α`. -/
 meta def mkFreshResultType (userName := `α) : DoElabM Expr := do
   mkFreshExprMVar (mkSort (mkLevelSucc (← read).monadInfo.u)) (userName := userName)
@@ -442,14 +435,17 @@ meta def mkFreshResultType (userName := `α) : DoElabM Expr := do
 Has the effect of ``e >>= fun (x : eResultTy) => $(← k `(x))``.
 Ensures that `e` has type `m eResultTy`.
 -/
-meta def mkBind (x : Name) (eResultTy e : Expr) (k : Expr → DoElabM Expr) : DoElabM Expr := do
-  let (k, kResultTy) ← withLocalDeclD x eResultTy fun x => do
+meta def mkBindCancellingPure (x : Name) (eResultTy e : Expr) (k : Expr → DoElabM Expr) : DoElabM Expr := do
+  withLocalDeclD x eResultTy fun x => do
     let body ← k x
+    let body' := body.consumeMData
+    if body'.isAppOfArity ``Pure.pure 4 && body'.getArg! 3 == x then
+      return e
     let bodyTy ← inferType body
     let .app _m kResultTy := bodyTy
       | throwError "Expected some monadic type for{indentExpr body}\nbut got{indentExpr bodyTy}"
-    return (← mkLambdaFVars #[x] body, kResultTy)
-  mkBindApp eResultTy kResultTy e k
+    let k ← mkLambdaFVars #[x] body
+    mkBindApp eResultTy kResultTy e k
 
 /--
 A variant of `Term.elabType` that takes the universe of the monad into account, unless
@@ -466,29 +462,9 @@ meta def elabBinder (binder : Syntax) (x : Expr → DoElabM α) : DoElabM α := 
   controlAt TermElabM fun runInBase => Term.elabBinder binder (runInBase ∘ x)
 
 /--
-Keeps only those `mutVars` that have different definitions in `oldCtx` and `newCtx`.
-The result array has the same order as `mutVars`.
+Batched version of `Lean.LocalContext.findFromUserName?`.
+Finds the reaching definitions for each of the given `userNames` up to a certain `start` index, if any.
 -/
-meta def filterReassigned (mutVars : Array Name) (oldCtx newCtx : LocalContext) : Array Name :=
-  let oldDefs := mutVars.map oldCtx.findFromUserName?
-  let newDefs := mutVars.map newCtx.findFromUserName?
-  oldDefs.zip newDefs
-    -- this filters out names that are defined in newCtx but not in oldCtx
-    |>.filterMap (fun (old, new) => (·, ·) <$> old <*> new)
-    |>.filter (Function.uncurry (·.toExpr != ·.toExpr))
-    |>.map (·.1.userName)
-
-/--
-The union of `filterReassigned` results for all `childCtxs` relative to the given `rootCtx`.
-The result array has the same order as `(← read).mutVars`.
--/
-meta def getReassignedMutVars (rootCtx : LocalContext) (childCtxs : Array LocalContext) : DoElabM (Array Name) := do
-  let mutVars := (← read).mutVars
-  let mut reassignedMutVars := Std.HashSet.emptyWithCapacity mutVars.size
-  for childCtx in childCtxs do
-    reassignedMutVars := reassignedMutVars.insertMany (filterReassigned mutVars rootCtx childCtx)
-  return mutVars.filter reassignedMutVars.contains
-
 meta def _root_.Lean.LocalContext.findFromUserNames (lctx : LocalContext) (userNames : Std.HashSet Name) (start := 0) : Array LocalDecl :=
   Array.reverse <| Id.run <| ExceptT.runCatch do
     let (_, _, acc) ← lctx.foldrM (init := (userNames, lctx.numIndices - 1, #[])) fun decl (userNames, i, acc) => do
@@ -500,7 +476,22 @@ meta def _root_.Lean.LocalContext.findFromUserNames (lctx : LocalContext) (userN
         pure (userNames, i - 1, acc)
     return acc
 
-meta def addVarDefsAsNonDep (tunneledVars : Std.HashSet Name) (rootCtx childCtx : LocalContext) : LocalContext := Id.run do
+/--
+The subset of `(← read).mutVars` that were reassigned in any of the `childCtxs` relative to the
+given `rootCtx`. The result array has the same order as `(← read).mutVars`.
+-/
+meta def getReassignedMutVars (rootCtx : LocalContext) (mutVars : Array Name) (childCtxs : Array LocalContext) : Array Name := Id.run do
+  let mut reassignedMutVars := Std.HashSet.emptyWithCapacity mutVars.size
+  for childCtx in childCtxs do
+    let newDefs := childCtx.findFromUserNames (.ofArray mutVars) (start := rootCtx.numIndices)
+    reassignedMutVars := reassignedMutVars.insertMany (newDefs.map (·.userName))
+  return mutVars.filter reassignedMutVars.contains
+
+/--
+Adds the new reaching definitions of the given `tunneledVars` in `childCtx` relative to `rootCtx` as
+non-dependent decls.
+-/
+meta def _root_.Lean.LocalContext.addNewVarDefsAsNonDep (rootCtx childCtx : LocalContext) (tunneledVars : Std.HashSet Name) : LocalContext := Id.run do
   let tunnelDecls := childCtx.findFromUserNames tunneledVars (start := rootCtx.numIndices)
   let mut rootCtx := rootCtx
   for decl in tunnelDecls do
@@ -509,15 +500,15 @@ meta def addVarDefsAsNonDep (tunneledVars : Std.HashSet Name) (rootCtx childCtx 
 
 /--
 Creates a new continuation variable of type `m α` given the result type `α`.
-The `letToHaveVars` is a superset of the `let`-bound variable names that the jumps will refer to.
+The `tunneledVars` is a superset of the `let`-bound variable names that the jumps will refer to.
 Often it will be the `mut` variables. Leaving it empty inlines `let`-bound variables at jump sites.
 -/
-meta def mkFreshContVar (resultType : Expr) (letToHaveVars : Array Name) : DoElabM ContVarId := do
+meta def mkFreshContVar (resultType : Expr) (tunneledVars : Array Name) : DoElabM ContVarId := do
   let name ← mkFreshId
   let contVarId := ContVarId.mk name
   let type ← mkMonadicType resultType
-  let letToHaveVars := Std.HashSet.ofArray letToHaveVars
-  let cvInfo := { type, jumps := #[], lctx := (← getLCtx), letToHaveVars }
+  let tunneledVars := Std.HashSet.ofArray tunneledVars
+  let cvInfo := { type, jumps := #[], lctx := (← getLCtx), tunneledVars }
   modify fun s => { s with contVars := s.contVars.insert contVarId cvInfo }
   return contVarId
 
@@ -529,7 +520,7 @@ meta def ContVarId.find (contVarId : ContVarId) : DoElabM ContVarInfo := do
 /-- Creates a new jump site for the continuation variable, to be synthesized later. -/
 meta def ContVarId.mkJump (contVarId : ContVarId) : DoElabM Expr := do
   let info ← contVarId.find
-  let lctx := addVarDefsAsNonDep info.letToHaveVars info.lctx (← getLCtx)
+  let lctx := info.lctx.addNewVarDefsAsNonDep (← getLCtx) info.tunneledVars
   let mvar ← withLCtx' lctx (mkFreshExprMVar info.type)
   let jumps := info.jumps.push { mvar, ref := (← getRef) }
   modify fun s => { s with contVars := s.contVars.insert contVarId { info with jumps } }
@@ -562,13 +553,11 @@ variable. The result array has the same order as `(← read).mutVars`.
 meta def ContVarId.getReassignedMutVars (contVarId : ContVarId) (rootCtx : LocalContext) : DoElabM (Array Name) := do
   let info ← contVarId.find
   let mvarDecls ← info.jumps.mapM (·.mvar.mvarId!.getDecl)
-  Do.getReassignedMutVars rootCtx (mvarDecls.map (·.lctx))
+  return Do.getReassignedMutVars rootCtx (← read).mutVars (mvarDecls.map (·.lctx))
 
 /--
-Capture the local context `ctx` and call `k` with `restoreCtx : Name → DoElabM Expr → DoElabM Expr`.
-Calling `restoreCtx r k` resets the local context to `ctx`, just like `withLCtx' ctx`.
-Furthermore, it will figure out reassigned definitions of mut vars and the result `r` and make them
-available in the local context.
+Restores the local context to `oldCtx` and adds the new reaching definitions of the mut vars and
+result. Then resume the continuation `k` with the `mutVars` restored to the given `oldMutVars`.
 
 This function is useful to de-nest
 ```
@@ -596,71 +585,50 @@ Note that the continuation of the `let z ← ...` bind, roughly
 needs to elaborated in a local context that contains the reassignment of `x`, but not the shadowing
 mut var definition of `y`.
 -/
-meta def restoreLCtxKeepingMutVarDefs (oldLCtx : LocalContext) (oldMutVars : Array Name) (resultName : Name) (k : DoElabM α) : DoElabM α := do
-  -- Find the subset of mut vars that are reassigned.
-  let reassignedMutVars := filterReassigned oldMutVars oldLCtx (← getLCtx)
-  let reassignedMutVarDefs ← reassignedMutVars.mapM (getFVarFromUserName ·)
-  -- Tunnel mut vars and result into the outer context:
-  let tunnelDecls ← reassignedMutVarDefs
-    |>.push (← getFVarFromUserName resultName)
-    |>.mapM (·.fvarId!.getDecl)
-  -- Forget the value of every ldecl.
-  let tunnelDecls := tunnelDecls.map fun decl =>
-    .cdecl 0 decl.fvarId decl.userName decl.type decl.binderInfo decl.kind
-  withLCtx' oldLCtx do
-  withExistingLocalDecls tunnelDecls.toList do
-  withReader (fun ctx => { ctx with mutVars := oldMutVars }) do
-  k
+meta def withLCtxKeepingMutVarDefs (oldCtx : LocalContext) (oldMutVars : Array Name) (resultName : Name) (k : DoElabM α) : DoElabM α := do
+  let newCtx := oldCtx.addNewVarDefsAsNonDep (← getLCtx) (.ofArray <| oldMutVars.push resultName)
+  withLCtx' newCtx <| withReader (fun ctx => { ctx with mutVars := oldMutVars }) k
 
 /--
-This data type communicates to `do` element elaborators whether they are the last element of the
-`do` block and what is the expected monadic result type. When it's not the last element, there's a
-continuation for elaborating the remaining `do` elements of the block.
+Elaboration of a `do` block `do $e; $rest`, results in a call
+``elabTerm `(do $e; $rest) = elabElem e dec``, where `elabElem e ·` is the elaborator for `do`
+`e`, and `dec` is the `DoElemCont` describing the elaboration of the rest of the block `rest`.
 
-Every `do` element has a notion of "result", which can be given a name with monadic bind.
-Clearly, for expression elements `e : m α`, the result has type `α`.
+If the semantics of `e` resumes its continuation `rest`, its elaborator must bind its result to
+`resultName`, ensure that it has type `resultType` and then elaborate `rest` using `dec`.
+
+Clearly, for term elements `e : m α`, the result has type `α`.
 More subtly, for binding elements `let x := e` or `let x ← e`, the result has type `PUnit` and is
-unrelated to the type of any bound variable `x`.
+unrelated to the type of the bound variable `x`.
+
+Examples:
+* `return` drops the continuation; `return x; pure ()` elaborates to `pure x`.
+* `let x ← e; rest x` elaborates to `e >>= fun x => rest x`.
+* `let x := 3; let y ← (let x ← e); rest x` elaborates to
+  `let x := 3; e >>= fun x_1 => let y := (); rest x`, which is immediately zeta-reduced to
+  `let x := 3; e >>= fun x_1 => rest x`.
+* `one; two` elaborates to `one >>= fun (_ : PUnit) => two`; it is an error if `one` does not have
+  type `PUnit`.
 -/
-inductive DoElemCont where
-  /--
-  The `do` element under elaboration is the last of its `do` block and has the given result type.
-  The elaborator must generate a closed expression for this monadic result type.
-  For example, `let x ← e` elaborates to `e >>= fun x => pure ()`.
-  -/
-  | last : (resultType : Expr) → DoElemCont
+structure DoElemCont where
+  /-- The name of the monadic result variable. -/
+  resultName : Name
+  /-- The type of the monadic result. -/
+  resultType : Expr
+  /-- The continuation to elaborate the `rest` of the block. -/
+  k : DoElabM Expr
 
-  /--
-  The `do` element under elaboration is followed by other elements in the `do` block,
-  and they can be elaborated using `k`. `k` expects that the result of the previous `do` element
-  has type `resultType` and can be found in the local context under user name `resultName`.
-
-  Examples:
-  * `return` drops the continuation; `return x; pure ()` elaborates to `pure x`.
-  * `let x ← e; rest x` elaborates to `e >>= fun x => rest x`.
-  * `let x := 3; let y ← (let x ← e); rest x` elaborates to
-    `let x := 3; e >>= fun x_1 => let y := (); rest x`, which is immediately zeta-reduced to
-    `let x := 3; e >>= fun x_1 => rest x`.
-  * `one; two` elaborates to `one >>= fun (_ : PUnit) => two`; it is an error if `one` does not have
-    type `PUnit`.
-  -/
-  | cont : (resultName : Name) → (resultType : Expr) → (k : DoElabM Expr) → DoElemCont
-
-/-- The result type `α` of the previous `do` element of type `m α`. -/
-meta def DoElemCont.resultType (k : DoElemCont) : Expr :=
-  match k with
-  | .last resultType => resultType
-  | .cont _ resultType _ => resultType
+/-- Create a `DoElemCont` returning the result using `pure`. -/
+meta def DoElemCont.mkPure (resultType : Expr) : TermElabM DoElemCont := do
+  let r ← mkFreshUserName `r
+  return { resultName := r, resultType, k := do mkPureApp resultType (← getFVarFromUserName r) }
 
 /--
-If `k` matches `.last rType`, just return `e`.
-If `k` matches `.cont rName rType k`, return `e >>= fun (rName : rType) => $(← k)`.
-In both cases, ensure that `e` has type `m rType`.
+Return `$e >>= fun ($dec.resultName : $dec.resultType) => $(← dec.k)`, cancelling
+the bind if `$(← dec.k)` is `pure $dec.resultName`.
 -/
-meta def DoElemCont.mkBindUnlessLast (k : DoElemCont) (e : Expr) : DoElabM Expr := do
-  match k with
-  | .last resultType => Term.ensureHasType (← mkMonadicType resultType) e
-  | .cont resultName resultType k => mkBind resultName resultType e (fun _ => k)
+meta def DoElemCont.mkBindUnlessPure (dec : DoElemCont) (e : Expr) : DoElabM Expr := do
+  mkBindCancellingPure dec.resultName dec.resultType e (fun _ => dec.k)
 
 /-- Has the effect of ``let x : ty := rhs; $(← k `(x))`` and then zeta-reducing the expression. -/
 meta def withInlinedLetDecl (name : Name) (type rhs : Expr) (k : DoElabM Expr) : DoElabM Expr := do
@@ -670,26 +638,13 @@ meta def withInlinedLetDecl (name : Name) (type rhs : Expr) (k : DoElabM Expr) :
     return e.replaceFVar x rhs
 
 /--
-If `k` matches `.last rType`, just return `pure ()`.
-If `k` matches `.cont rName rType k`, return `let rName : PUnit := PUnit.unit; $(← k)`.
-In both cases, ensure that the result type `rType` is `PUnit`.
+Return `let $k.resultName : PUnit := PUnit.unit; $(← k.k)`, ensuring that the result type of `k.k`
+is `PUnit` and then immediately zeta-reduce the `let`.
 -/
-meta def DoElemCont.continueWithUnit (k : DoElemCont) : DoElabM Expr := do
+meta def DoElemCont.continueWithUnit (dec : DoElemCont) : DoElabM Expr := do
   let unit ← mkPUnitUnit
-  discard <| Term.ensureHasType k.resultType unit
-  match k with
-  | .cont n _ k => do withInlinedLetDecl n (← mkPUnit) unit k
-  | .last _ => mkPureApp (← mkPUnit) unit
-
-/--
-If `k` matches `.last ..`, just return `k`.
-If `k` matches `.cont _ _ k`, wrap `restoreLCtxKeepingMutVarDefs` around the continuation `k`.
--/
-meta def DoElemCont.withRestoredLCtxAndMutVarDefs (k : DoElemCont) (lctx : LocalContext) (mutVars : Array Name) : DoElemCont :=
-  match k with
-  | .last .. => k
-  | .cont rName resultType k => DoElemCont.cont rName resultType do
-    restoreLCtxKeepingMutVarDefs lctx mutVars rName k
+  discard <| Term.ensureHasType dec.resultType unit
+  withInlinedLetDecl dec.resultName (← mkPUnit) unit dec.k
 
 /--
 Call `caller` with a duplicable proxy of `dec`.
@@ -699,16 +654,15 @@ elaborated once to fill in the RHS of this join point.
 This is useful for control-flow constructs like `if` and `match`, where multiple tail-called
 branches share the continuation.
 -/
-meta def DoElemCont.withDuplicableCont (dec : DoElemCont) (caller : DoElemCont → DoElabM Expr) : DoElabM Expr := do
-  let .cont rName resultType nondupK := dec | caller dec -- assumption: .last continuations are always duplicable
+meta def DoElemCont.withDuplicableCont (nondupDec : DoElemCont) (caller : DoElemCont → DoElabM Expr) : DoElabM Expr := do
   let α := (← read).doBlockResultType
   let mα ← mkMonadicType α
   let joinTy ← mkFreshExprMVar (mkSort (mkLevelSucc (← read).monadInfo.v)) (userName := `joinTy)
   let joinRhs ← mkFreshExprMVar joinTy (userName := `joinRhs)
   withLetDecl (← mkFreshUserName `__do_jp) joinTy joinRhs (kind := .implDetail) fun jp => do
     let mutVars := (← read).mutVars
-    let contVarId ← mkFreshContVar α (mutVars.push rName)
-    let duplicableDec := DoElemCont.cont rName resultType contVarId.mkJump
+    let contVarId ← mkFreshContVar α (mutVars.push nondupDec.resultName)
+    let duplicableDec := { nondupDec with k := contVarId.mkJump }
     let e ← caller duplicableDec
 
     -- Now determine whether we need to realize the join point.
@@ -719,7 +673,7 @@ meta def DoElemCont.withDuplicableCont (dec : DoElemCont) (caller : DoElemCont �
     else if jumpCount = 1 then
       -- Linear use of the continuation. Do not introduce a join point; just emit the continuation
       -- directly.
-      contVarId.synthesizeJumps nondupK
+      contVarId.synthesizeJumps nondupDec.k
     else -- jumps.size > 1
       -- Non-linear use of the continuation. Introduce a join point and synthesize jumps to it.
 
@@ -736,13 +690,13 @@ meta def DoElemCont.withDuplicableCont (dec : DoElemCont) (caller : DoElemCont �
 
       -- Assign the `joinRhs` with the result of the continuation.
       let rhs ← joinRhs.mvarId!.withContext do
-        withLocalDeclsDND (reassignedDecls.map (fun d => (d.userName, d.type)) |>.push (rName, resTy)) fun xs => do
-          mkLambdaFVars xs (← nondupK)
+        withLocalDeclsDND (reassignedDecls.map (fun d => (d.userName, d.type)) |>.push (nondupDec.resultName, resTy)) fun xs => do
+          mkLambdaFVars xs (← nondupDec.k)
       discard <| isDefEq joinRhs rhs
 
       -- Finally, assign the MVars with the jump to `jp`.
       contVarId.synthesizeJumps do
-        let r ← getFVarFromUserName rName
+        let r ← getFVarFromUserName nondupDec.resultName
         let mut jump := jp
         for name in reassignedMutVars do
           let newDefn ← getLocalDeclFromUserName name
@@ -856,7 +810,7 @@ meta def getContinueCont : DoElabM (Option (DoElabM Expr)) := do
   return (← read).contInfo.toContInfo.continueCont
 
 mutual
-  meta def elabElem (dooElem : TSyntax `dooElem) (k : DoElemCont) : DoElabM Expr := withRef dooElem do
+  meta def elabElem (dooElem : TSyntax `dooElem) (dec : DoElemCont) : DoElabM Expr := withRef dooElem do
     match dooElem with
     -- First off the three constructs that discard the continuation `k`:
     | `(dooElem| return $e) =>
@@ -873,25 +827,25 @@ mutual
         | throwError "`continue` must be nested inside a loop"
       continueCont
     | `(dooElem| $e:term) =>
-      let mα ← mkMonadicType k.resultType
+      let mα ← mkMonadicType dec.resultType
       let e ← Term.elabTermEnsuringType e mα
-      k.mkBindUnlessLast e
+      dec.mkBindUnlessPure e
     | `(dooElem| let $[mut%$mutTk?]? $x:ident $[: $xType?]? ← $rhs) =>
       checkMutVarsForShadowing x.getId
       let xType ← elabType xType?
       let lctx ← getLCtx
       let mutVars := (← read).mutVars
-      elabElem rhs <| .cont x.getId xType do
-        restoreLCtxKeepingMutVarDefs lctx mutVars x.getId do
-          declareMutVar? mutTk? x.getId k.continueWithUnit
+      elabElem rhs <| .mk x.getId xType do
+        withLCtxKeepingMutVarDefs lctx mutVars x.getId do
+          declareMutVar? mutTk? x.getId dec.continueWithUnit
     | `(dooElem| $x:ident ← $rhs) =>
       throwUnlessMutVarDeclared x.getId
       let xType := (← getLocalDeclFromUserName x.getId).type
       let lctx ← getLCtx
       let mutVars := (← read).mutVars
-      elabElem rhs <| .cont x.getId xType do
-        restoreLCtxKeepingMutVarDefs lctx mutVars x.getId do
-          k.continueWithUnit
+      elabElem rhs <| .mk x.getId xType do
+        withLCtxKeepingMutVarDefs lctx mutVars x.getId do
+          dec.continueWithUnit
     | `(dooElem| let $[mut%$mutTk?]? $x:ident $[: $xType?]? := $rhs) =>
       checkMutVarsForShadowing x.getId
       -- We want to allow `do let foo : Nat = Nat := rfl; pure (foo ▸ 23)`. Note that the type of
@@ -899,14 +853,14 @@ mutual
       -- Hence `freshLevel := true` (yes, even for `mut` vars; why not?).
       let xType ← elabType xType? (freshLevel := true)
       let rhs ← Term.elabTermEnsuringType rhs xType
-      mkLetThen x.getId xType rhs fun _xdefn => declareMutVar? mutTk? x.getId k.continueWithUnit
+      mapLetDecl (usedLetOnly := false) x.getId xType rhs fun _xdefn => declareMutVar? mutTk? x.getId dec.continueWithUnit
     | `(dooElem| $x:ident := $rhs) =>
       throwUnlessMutVarDeclared x.getId
       let xType := (← getLocalDeclFromUserName x.getId).type
       let rhs ← Term.elabTermEnsuringType rhs xType
-      mkLetThen x.getId xType rhs fun _xdefn => k.continueWithUnit
+      mapLetDecl (usedLetOnly := false) x.getId xType rhs fun _xdefn => dec.continueWithUnit
     | `(dooElem| if $cond then $thenDooSeq $[else $elseDooSeq?]?) =>
-      k.withDuplicableCont fun k => do
+      dec.withDuplicableCont fun k => do
         let then_ ← elabElems1 (getDooElems thenDooSeq) k
         let else_ ← match elseDooSeq? with
           | none => k.continueWithUnit
@@ -914,7 +868,7 @@ mutual
         let then_ ← Term.exprToSyntax then_
         let else_ ← Term.exprToSyntax else_
         Term.elabTerm (← `(if $cond then $then_ else $else_)) none
-    | `(dooElem| doo $dooSeq) => elabElems1 (getDooElems dooSeq) k
+    | `(dooElem| doo $dooSeq) => elabElems1 (getDooElems dooSeq) dec
     | `(dooElem| for $x:ident in $xs doo $dooSeq) =>
       -- set_option pp.universes true in #print forBreakMem_
       let uα ← mkFreshLevelMVar
@@ -958,7 +912,7 @@ mutual
           -- Elaborate the loop body.
           let block ← enterLoopBody eoσ returnK breakK.mkJump continueK.mkJump do
             let n ← mkFreshUserName `r
-            elabElems1 (getDooElems dooSeq) (DoElemCont.cont n (← mkPUnit) continueK.mkJump)
+            elabElems1 (getDooElems dooSeq) (.mk n (← mkPUnit) continueK.mkJump)
 
           -- Compute the set of reassigned mut vars and its complement.
           -- Take care to preserve the declaration order that is manifest in the array `mutVars`.
@@ -997,17 +951,16 @@ mutual
         k r
       let kafter ← withLocalDeclD (← mkFreshUserName `s) σ fun postS => do mkLambdaFVars #[postS] <| ← do
         bindMutVarsFromTuple reassignedMutVars.toList postS.fvarId! do
-          let k ← k.continueWithUnit
+          let k ← dec.continueWithUnit
           Term.ensureHasType (← mkMonadicType γ) k
       let instFoldable ← Term.mkInstMVar <| mkApp2 (mkConst ``Foldable [uρ, uα, mi.u]) ρ α
       let app := mkConst ``Foldable.forBreak_ [uρ, uα, mi.u, mi.v]
       let app := mkApp5 app ρ α instFoldable mi.m instMonad
       let app := mkApp8 app σ ε γ xs preS body kreturn kafter
       return app
-    | `(dooElem| for $x:ident in $xs $inv:dooInvariant doo $dooSeq) =>
+    | `(dooElem| for $x:ident in $xs invariant $cursorBinder $stateBinders* => $body doo $dooSeq) =>
       --trace[Elab.do] "cursorBinder: {cursorBinder}"
-      let `(dooInvariant| invariant $cursorBinder $[$stateBinders]* => $body) := inv | throwUnsupportedSyntax
-      let call ← elabElem (← `(dooElem| for $x:ident in $xs doo $dooSeq)) k
+      let call ← elabElem (← `(dooElem| for $x:ident in $xs doo $dooSeq)) dec
       let_expr Foldable.forBreak_ ρ α _ _ _ σ _ _ xs s _ _ _ := call
         | throwError "Internal elaboration error: `for` loop did not elaborate to a call of `Foldable.forBreak_`."
       call.withApp fun head args => do
@@ -1026,7 +979,6 @@ mutual
       let mutVarsTuple ← Term.exprToSyntax s
       let cursorσ := mkApp2 (mkConst ``Prod [v, v]) cursor σ
       let syn ← `(fun ($cursorBinder, $mutVarsTuple) $stateBinders* => $body)
-      logInfo m!"cursorσ: {cursorσ}, ps: {ps}, instWP: {instWP}, syn: {syn}"
       let success ← Term.elabFun (← `(fun ($cursorBinder, $mutVarsTuple) $stateBinders* => $body)) (← mkArrow cursorσ assertion)
       let inv := mkApp3 (mkConst ``Std.Do.PostCond.noThrow [w]) ps cursorσ success
       return mkApp4 (mkAppN head args) instFoldable ps instWP inv
@@ -1045,12 +997,26 @@ mutual
       -- So we need to pack up our effects and unpack them after the `try`.
       -- We could optimize for the `.last` case by omitting the state tuple ... in the future.
       let mi := (← read).monadInfo
-      let α := k.resultType
-      let ασ ← mkFreshExprMVar (mkSort (mkLevelSucc mi.u)) (userName := `ασ)
+      let α := dec.resultType
+      -- γ is the result type of the `try` block. It is `stM m (t m)` for whatever `t` is necessary
+      -- to restore reassigned mut vars, early `return`, `break` and `continue`.
+      let γ ← mkFreshExprMVar (mkSort (mkLevelSucc mi.u)) (userName := `γ)
       let rName ← mkFreshUserName `r
-      let pureKVar ← mkFreshContVar ασ ((← read).mutVars.push rName)
-      let pureK := DoElemCont.cont rName α pureKVar.mkJump
-      let body ← elabElems1 (getDooElems trySeq) pureK
+      let mutVars := (← read).mutVars
+      let pureKVar ← mkFreshContVar γ mutVars
+      let pureK := DoElemCont.mk rName α pureKVar.mkJump
+      let returnKVar ← mkFreshContVar γ mutVars
+      let ρ := (← read).earlyReturnType
+      let returnK (e : Expr) : DoElabM Expr := do
+        return mkApp (← returnKVar.mkJump) (← Term.ensureHasType ρ e)
+      let breakKVar ← mkFreshContVar γ mutVars
+      let breakK := breakKVar.mkJump
+      let continueKVar ← mkFreshContVar γ mutVars
+      let continueK := continueKVar.mkJump
+      let withConts k := do
+        let e ← enterLoopBody γ returnK breakK continueK (k <| ← DoElemCont.mkPure α)
+        return e
+      let body ← withConts (elabElems1 (getDooElems trySeq))
       let body ← xs.zip (eTypes?.zip catchSeqs) |>.foldlM (init := body) fun body (x, eType?, catchSeq) => do
         let x := Term.mkExplicitBinder x.raw[0] <| match eType? with
           | some eType => eType
@@ -1064,40 +1030,35 @@ mutual
             else
               inferType x
           let uε ← getDecLevel ε
-          let catch_ ← elabElems1 (getDooElems catchSeq) pureK
+          let catch_ ← withConts (elabElems1 (getDooElems catchSeq))
           let catch_ ← mkLambdaFVars #[x] catch_
           return (catch_, ε, uε)
         if eType?.isSome then
           let inst ← Term.mkInstMVar <| mkApp2 (mkConst ``MonadExceptOf [uε, mi.u, mi.v]) ε mi.m
           return mkApp6 (mkConst ``tryCatchThe [uε, mi.u, mi.v])
-            ε mi.m inst ασ body catch_
+            ε mi.m inst γ body catch_
         else
           let inst ← Term.mkInstMVar <| mkApp2 (mkConst ``MonadExcept [uε, mi.u, mi.v]) ε mi.m
           return mkApp6 (mkConst ``MonadExcept.tryCatch [uε, mi.u, mi.v])
-            ε mi.m inst ασ body catch_
+            ε mi.m inst γ body catch_
       let body ← match finSeq? with
         | none => pure body
         | some finSeq => do
           let β ← mkFreshResultType `β
-          let fin ← enterFinally β <| elabElems1 (getDooElems finSeq) (.last β)
+          let fin ← enterFinally β <| elabElems1 (getDooElems finSeq) (← DoElemCont.mkPure β)
           let instMonadFinally ← Term.mkInstMVar <| mkApp (mkConst ``MonadFinally [mi.u, mi.v]) mi.m
           let instFunctor ← Term.mkInstMVar <| mkApp (mkConst ``Functor [mi.u, mi.v]) mi.m
           return mkApp7 (mkConst ``tryFinally [mi.u, mi.v])
-            mi.m ασ β instMonadFinally instFunctor body fin
-      let reassignedMutVars ← pureKVar.getReassignedMutVars (← ασ.mvarId!.getDecl).lctx
+            mi.m γ β instMonadFinally instFunctor body fin
+      let reassignedMutVars ← pureKVar.getReassignedMutVars (← γ.mvarId!.getDecl).lctx
       pureKVar.synthesizeJumps do
         let r ← getFVarFromUserName rName
         let (tuple, tupleTy) ← mkProdMkN (#[r] ++ (← reassignedMutVars.mapM (getFVarFromUserName ·)))
-        discard <| isDefEq ασ tupleTy
-        mkPureApp ασ tuple
-      mkBind (← mkFreshUserName `r) ασ body fun p => do
-        match k with
-        | .last _ =>
-          let a ← if reassignedMutVars.isEmpty then pure p else (·.1) <$> getProdFields p ασ
-          mkPureApp α a
-        | .cont rName _ k => do
-          bindMutVarsFromTuple (rName :: reassignedMutVars.toList) p.fvarId! do
-            k
+        discard <| isDefEq γ tupleTy
+        mkPureApp γ tuple
+      mkBindCancellingPure (← mkFreshUserName `r) γ body fun p => do
+        bindMutVarsFromTuple (dec.resultName :: reassignedMutVars.toList) p.fvarId! do
+          dec.k
     | _ => throwError "unexpected do element {dooElem}, {repr dooElem}"
 
   meta def elabElems1 (dooElems : Array (TSyntax `dooElem)) (k : DoElemCont) : DoElabM Expr := do
@@ -1105,14 +1066,15 @@ mutual
     let init := dooElems.pop
     let unit ← mkPUnit
     let r ← mkFreshUserName `r
-    init.foldr (init := elabElem last k) fun el k => elabElem el (.cont r unit k)
+    init.foldr (init := elabElem last k) fun el k => elabElem el (.mk r unit k)
 
 end
 
 meta def elabDooBlock (dooSeq : TSyntax `dooSeq) (expectedType? : Expr) : TermElabM Expr := do
   Term.tryPostponeIfNoneOrMVar expectedType?
   let ctx ← mkContext expectedType?
-  let res ← elabElems1 (getDooElems dooSeq) (.last ctx.doBlockResultType) |>.run ctx |>.run' {}
+  let cont ← DoElemCont.mkPure ctx.doBlockResultType
+  let res ← elabElems1 (getDooElems dooSeq) cont |>.run ctx |>.run' {}
   -- logInfo m!"res: {res}"
   trace[Elab.do] "{res}"
   pure res
@@ -2185,7 +2147,7 @@ error: typeclass instance problem is stuck, it is often due to metavariables
 example := doo return 42
 /--
 error: typeclass instance problem is stuck, it is often due to metavariables
-  Bind ?m.11
+  Bind ?m.12
 -/
 #guard_msgs (error) in
 example := doo let x <- ?z; ?y
@@ -2321,440 +2283,3 @@ else
   else
     x := x + 5
   return x + y
-
-open Std.Do
-class WPAttach (m : Type u → Type v) (ps : outParam (PostShape.{u})) [Monad m] extends WP m ps where
-  attach (prog : m α) (p : α → Prop) (h : ⦃⌜True⌝⦄ prog ⦃⇓r => ⌜p r⌝⦄) : ∃ (prog' : m (Subtype p)), prog = Subtype.val <$> prog'
-
-instance : WPAttach Id .pure where
-  attach prog _ h := ⟨⟨prog, h .intro⟩, rfl⟩
-
-instance [Monad m] [LawfulMonad m] [WPAttach m ps] : WPAttach (StateT σ m) (.arg σ ps) where
-  attach prog p h := by
-    let f (s : σ) := WPAttach.attach (prog s) (fun (a, s') => p a) (h s)
-    exists fun s => (fun ⟨⟨a, s'⟩, h⟩ => ⟨⟨a, h⟩, s'⟩) <$> (f s).choose
-    ext s
-    simp [Functor.map, StateT.map, StateT.run]
-    conv => lhs; rw [(f s).choose_spec]
-
-instance [Monad m] [WPAttach m ps] : WPAttach (ReaderT ρ m) (.arg ρ ps) where
-  attach prog p h := by
-    let f (r : ρ) := WPAttach.attach (prog r) p (h r)
-    exists fun r => (f r).choose
-    ext r
-    simp [Functor.map, ReaderT.run]
-    conv => lhs; rw [(f r).choose_spec]
-
-instance [Monad m] [LawfulMonad m] [WPAttach m ps] : WPAttach (ExceptT ε m) (.except ε ps) where
-  attach prog p h := by
-    have h'  : ∃ prog', prog.run = Subtype.val <$> prog' := WPAttach.attach (ps:=ps) prog.run (fun | .ok a => p a | _ => False) <| by
-      simp [Triple, WP.wp] at h
-      simp [Triple, ExceptT.run]
-      apply SPred.entails.trans h
-      apply SPred.bientails.mp
-      apply SPred.bientails.of_eq
-      congr; ext x; split <;> rfl
-    exists ExceptT.mk <| (fun | ⟨.ok a, h⟩ => Except.ok ⟨a, h⟩ | ⟨.error e, _⟩ => Except.error e) <$> h'.choose
-    ext
-    conv => lhs; rw [h'.choose_spec]
-    simp [ExceptT.mk, ExceptT.run, Functor.map, ExceptT.map]
-    rw [map_eq_pure_bind]
-    congr
-    ext x
-    match x with
-    | .mk a h =>
-    cases a <;> rfl
-
-instance [Monad m] [LawfulMonad m] [WPAttach m ps] : WPAttach (OptionT m) (.except PUnit ps) where
-  attach prog p h := by
-    have h'  : ∃ prog', prog.run = Subtype.val <$> prog' := WPAttach.attach (ps:=ps) prog.run (fun | .some a => p a | _ => False) <| by
-      simp [Triple, WP.wp] at h
-      simp [Triple]
-      apply SPred.entails.trans h
-      apply SPred.bientails.mp
-      apply SPred.bientails.of_eq
-      congr; ext x; split <;> rfl
-    exists OptionT.mk <| (fun | ⟨.some a, h⟩ => Option.some ⟨a, h⟩ | ⟨.none, _⟩ => Option.none) <$> h'.choose
-    ext
-    conv => lhs; rw [h'.choose_spec]
-    simp [OptionT.mk, OptionT.run, Functor.map, OptionT.bind, OptionT.pure]
-    rw [map_eq_pure_bind]
-    congr
-    ext x
-    match x with
-    | .mk a h =>
-    cases a <;> rfl
-
-class Foldable (ρ : Type u) (α : outParam (Type v)) where
-  foldr : (α → β → β) → β → ρ → β
-
-instance : Foldable (List α) α where
-  foldr := List.foldr
-
-class ForBreak (m : Type u → Type v) (ρ : Sort w) (α : outParam (Type v)) where
-  forBreak_ (f : α → OptionT m PUnit) (xs : ρ) : m PUnit
-
-instance [Foldable ρ α] [Monad m] : ForBreak m ρ α where
-  forBreak_ f xs :=
-    Foldable.foldr (fun x acc _ => SeqRight.seqRight (f x) (liftM ∘ acc) |>.run |> discard) pure xs ()
-
-
-/--
-A proof that the given loop body `prog` either breaks (i.e., returns `none`) or decreases according
-to the well-founded relation `rel` when run on the initial state `s`.
--/
-def DecreasesOn {σ m α} (rel : α → σ → σ → Prop) [Monad m] (prog : OptionT (StateT σ m) α) (s : σ) :=
-  ∃ prog' : m { p // p.1.casesOn True (fun a => rel a p.2 s) },
-    prog s = Subtype.val <$> prog'
-
-/--
-A proof that the `body` of a while loop terminates according to the well-founded relation `rel`.
--/
-structure LoopUntilBreak (rel : σ → σ → Prop) [Monad m]
-    (body : PUnit → OptionT (StateT σ m) PUnit) : Prop where
-  wf : WellFounded rel
-  bodyDecreases : ∀ s, DecreasesOn (fun _ => rel) (body ⟨⟩) s
-
--- The usual `partial def`-implementation-for-`WellFounded.fix`-definition dance
-
-
-namespace Std.Internal
-
-variable {α : Sort _} {β : α → Sort _} {C : α → Sort _} {C₂ : (a : α) → β a → Sort _}
-
-@[specialize]
-public partial def opaqueFix [∀ x, Nonempty (C x)] (F : (x : α) → ((y : α) → C y) → C x) (x : α) : C x :=
-  F x (opaqueFix F)
-
-@[expose]
-public def TerminatesTotally (F : (x : α) → ((y : α) → C y) → C x) : Prop :=
-  ∃ (r : α → α → Prop) (F' : (x : α) → ((y : α) → r y x → C y) → C x), WellFounded r ∧ ∀ x G, F x G = F' x (fun x _ => G x)
-
-/-
-SAFE assuming that the code generated by iteration over `F` is compatible
-with the kernel semantics of iteration over `F' : (x : α) → ((y : α) → r y x → C y) → C x`
-for all `F'` as in `TerminatesTotally`.
--/
-@[implemented_by opaqueFix]
-public def extrinsicFix [∀ x, Nonempty (C x)] (F : (x : α) → ((y : α) → C y) → C x) (x : α) : C x :=
-  open scoped Classical in
-  if h : TerminatesTotally F then
-    let F' := h.choose_spec.choose
-    let h := h.choose_spec.choose_spec
-    h.1.fix F' x
-  else
-    opaqueFix F x
-
-public def extrinsicFix_eq [∀ x, Nonempty (C x)] {F : (x : α) → ((y : α) → C y) → C x}
-    (h : TerminatesTotally F) {x : α} :
-    extrinsicFix F x = F x (extrinsicFix F) := by
-  simp only [extrinsicFix, dif_pos h]
-  rw [WellFounded.fix_eq, show (extrinsicFix F) = (fun y => extrinsicFix F y) by rfl]
-  simp only [extrinsicFix, dif_pos h, h.choose_spec.choose_spec.2]
-
-end Std.Internal
-
-/--
-Iterate a loop body `body : PUnit → OptionT (StateT σ m) PUnit` until it breaks (i.e., returns `none`).
-Every iteration must decrease in the state `σ` according to the well-founded relation `rel`.
-
-It is `loopUntilBreak body dw = discard (do body ⟨⟩; liftM (loopUntilBreak body dw)).run`.
--/
-def extrinsicLoopUntilBreak {σ : Type u} {m : Type u → Type v} [Monad m]
-    (body : PUnit.{max u v + 1} → OptionT (StateT σ m) PUnit)
-    : StateT σ m PUnit :=
-  @Std.Internal.extrinsicFix _ _ (fun s => ⟨pure (PUnit.unit, s)⟩) F
-where
-  F (s : σ) (recur : (s' : σ) → m (PUnit × σ)) : m (PUnit × σ) := do
-    let (u?, s') ← (body ⟨⟩).run s
-    match u? with
-    | none => pure (⟨⟩, s')
-    | some _ => recur s'
-
-/--
-Iterate a loop body `body : PUnit → OptionT (StateT σ m) PUnit` until it breaks (i.e., returns `none`).
-Every iteration must decrease in the state `σ` according to the well-founded relation `rel`.
-
-It is `loopUntilBreak body dw = discard (do body ⟨⟩; liftM (loopUntilBreak body dw)).run`.
--/
-def intrinsicLoopUntilBreak {σ : Type u} {m : Type u → Type v} {rel : σ → σ → Prop} [Monad m]
-    (body : PUnit.{max u v + 1} → OptionT (StateT σ m) PUnit)
-    (dw : LoopUntilBreak rel body) : StateT σ m PUnit :=
-  extrinsicLoopUntilBreak body
-
-theorem Std.Internal.TerminatesTotally.ofLoopUntilBreak {σ : Type u} {m : Type u → Type v} {rel : σ → σ → Prop}
-    [Monad m] [LawfulMonad m]
-    (body : PUnit.{max u v + 1} → OptionT (StateT σ m) PUnit)
-    (dw : LoopUntilBreak rel body) : TerminatesTotally (extrinsicLoopUntilBreak.F body) := by
-  exists rel
-  exists fun s recur => do
-    let ⟨⟨u?, s'⟩, h⟩ ← (dw.bodyDecreases s).choose
-    match _ : u? with
-    | none => pure (⟨⟩, s')
-    | some _ => recur s' h
-  constructor
-  · exact dw.wf
-  · intro s _
-    unfold extrinsicLoopUntilBreak.F; rw [OptionT.run, (dw.bodyDecreases s).choose_spec]
-    simp
-    congr
-    ext sub
-    cases sub with | mk p h =>
-    cases p with | mk a s =>
-    cases a <;> rfl
-
-/--
-Loop unrolling lemma for `extrinsicLoopUntilBreak`.
--/
-noncomputable def extrinsicLoopUntilBreak_eq {σ : Type u} {m : Type u → Type v} {rel : σ → σ → Prop}
-    [Monad m] [LawfulMonad m]
-    (body : PUnit → OptionT (StateT σ m) PUnit)
-    (dw : LoopUntilBreak rel body)
-    : extrinsicLoopUntilBreak body = discard (do body ⟨⟩; liftM (extrinsicLoopUntilBreak body)).run := by
-  open Std.Internal in
-  ext s
-  unfold extrinsicLoopUntilBreak
-  simp only [StateT.run, bind_pure_comp, discard, Functor.mapConst, OptionT.run,
-    bind, OptionT.bind, OptionT.mk, Function.comp_apply, StateT.map, StateT.bind,
-    Function.const_apply, map_bind]
-  let inst (s : σ) : Nonempty (m (PUnit × σ)) := ⟨pure (PUnit.unit, s)⟩
-  let prf := Std.Internal.TerminatesTotally.ofLoopUntilBreak body dw
-  conv => lhs; rw [@Std.Internal.extrinsicFix_eq _ _ (fun s => ⟨pure (PUnit.unit, s)⟩) _ prf]
-  unfold extrinsicLoopUntilBreak.F
-  congr
-  ext p
-  cases p with | mk a s =>
-  cases a
-  · simp [pure, StateT.pure]
-  · simp [liftM, monadLift, MonadLift.monadLift, OptionT.lift, OptionT.mk, Functor.map, StateT.map]
-
-/--
-Loop unrolling lemma for `intrinsicLoopUntilBreak`.
--/
-noncomputable def loopUntilBreak_eq {σ : Type u} {m : Type u → Type v} {rel : σ → σ → Prop}
-    [Monad m] [LawfulMonad m]
-    (body : PUnit → OptionT (StateT σ m) PUnit)
-    (dw : LoopUntilBreak rel body)
-    : intrinsicLoopUntilBreak body dw = discard (do body ⟨⟩; liftM (intrinsicLoopUntilBreak body dw)).run :=
-  extrinsicLoopUntilBreak_eq body dw
-
-/--
-Construct a `LoopUntilBreak` proof from a measure function and a
--/
-def LoopUntilBreak.ofMeasure [Monad m] {body : PUnit → OptionT (StateT σ m) PUnit}
-    (f : σ → Nat) (bodyDecreases : ∀ s, DecreasesOn (fun _ => (measure f).rel) (body ⟨⟩) s)
-    : LoopUntilBreak (measure f).rel body where
-  wf := (measure f).wf
-  bodyDecreases := bodyDecreases
-
-theorem DecreasesOn.of_WP {σ m α} {rel : α → σ → σ → Prop} [Monad m] [WPAttach m ps] {prog : OptionT (StateT σ m) α}
-    (h : ∀ s, ⦃fun preS => ⌜preS = s⌝⦄ prog ⦃(fun a s' => ⌜rel a s' s⌝, fun _ => ⌜True⌝, ExceptConds.false)⦄) :
-    ∀ s, DecreasesOn rel prog s := by
-  intro s
-  apply WPAttach.attach
-  have h := h s s
-  simp [WP.wp] at h
-  apply SPred.entails.trans h
-  apply SPred.bientails.mp
-  apply SPred.bientails.of_eq
-  congr; ext x
-  cases x with
-  | mk a s =>
-  cases a <;> grind
-
-def sqrtBinary (x : Nat) : Nat := Id.run do
-  let mut l := 0
-  let mut r := x + 1
-  -- Elaboration of `while 1 < r - l decreasing r - l do ...`
-  -- `decreasing r - l` elaborates to the `decreasingMeasure` binding below.
-  -- ?prf is an obligation to be solved by the user/automation.
-  (_, (l, r)) ← flip StateT.run (l, r) do
-    intrinsicLoopUntilBreak (fun _ => do
-      let mut (l, r) ← get
-      if r - l ≤ 1 then failure -- failure = break
-      let m := (l + r) / 2
-      if m * m > x then
-        r := m
-      else
-        l := m
-      set (l, r)) (LoopUntilBreak.ofMeasure (fun (l, r) => r - l) ?prf)
-  return l
-where finally
-  case prf =>
-    apply DecreasesOn.of_WP
-    intro (l, r)
-    mvcgen with (simp_wf; decreasing_tactic)
-
-/-- info: 6 -/
-#guard_msgs (info) in
-#eval sqrtBinary 42
-
-example : sqrtBinary 42 = 6 := by
-  unfold sqrtBinary
-  rw [loopUntilBreak_eq]
-  rw [loopUntilBreak_eq]
-  rw [loopUntilBreak_eq]
-  rw [loopUntilBreak_eq]
-  rw [loopUntilBreak_eq]
-  rw [loopUntilBreak_eq]
-  rfl
-
-/-
-def sqrtBinaryIdealized (x : Nat) : Nat := Id.run do
-  let mut l := 0
-  let mut r := x + 1
-  while 1 < r - l
-  decreasing r - l do
-    if r - l ≤ 1 then break
-    let m := (l + r) / 2
-    if m * m > x then
-      r := m
-    else
-      l := m
-  return l
--/
-where finally
-  case prf =>
-    apply DecreasesOn.of_WP
-    intro (l, r)
-    mvcgen
-    case vc1 => simp only [WellFoundedRelation.rel, InvImage, Nat.lt_wfRel]; grind
-    case vc2 => simp only [WellFoundedRelation.rel, InvImage, Nat.lt_wfRel]; grind
-
-    /-
-    dsimp
-    intro s
-    apply DecreasesOn.ite
-    · apply DecreasesOn.bind_left DecreasesOn.failure
-    · apply DecreasesOn.bind_right
-      intro _ s
-      apply DecreasesOn.get_then
-      apply DecreasesOn.ite
-      · apply DecreasesOn.bind_right
-        intro _ _
-        apply DecreasesOn.set
-        apply Relation.TransGen.single _
-        grind
-
-      intro (l, r)
-      apply DecreasesOn.ite
-      · apply DecreasesOn.bind_right
-        intro _
-
-
-    have app_ite {m} {α σ} {c : Prop} [Decidable c] {t e : OptionT (StateT σ m) α} {s : σ} : (ite c t e) s = ite c (t s) (e s) := by split <;> rfl
-    simp [Bind.bind, Pure.pure, Functor.map, OptionT.bind, OptionT.pure, OptionT.mk, StateT.bind, StateT.pure, StateT.get, StateT.set, app_ite]
-    exists ?f'
-    rotate_left
-    intro l r
-    simp [ite_apply]
--/
-theorem DecreasesOn.ite [Decidable c] [Monad m] (ht : DecreasesOn rel t s) (he : DecreasesOn rel e s) :
-    DecreasesOn (m:=m) rel (if c then t else e) s := by
-  split <;> assumption
-
-theorem DecreasesOn.bind_left {b : α → OptionT (StateT σ m) β} [Monad m] [LawfulMonad m]
-    (h : DecreasesOn rel a s) : DecreasesOn (m:=m) rel (do let x ← a; b x) s := sorry
-
-theorem DecreasesOn.bind_congr_right {b : α → OptionT (StateT σ m) β} {c : α → β → OptionT (StateT σ m) γ} [Monad m] [LawfulMonad m]
-    (h : ∀ y, DecreasesOn (m:=m) rel (do let x ← a; c x y) s) : DecreasesOn (m:=m) rel (do let x ← a; let y ← b x; c x y) s := sorry
-
-theorem DecreasesOn.bind_right {b : α → OptionT (StateT σ m) β} [Monad m] [LawfulMonad m]
-    (h : ∀ x s', DecreasesOn rel (b x) s') : DecreasesOn (m:=m) rel (do let x ← a; b x) s := sorry
-
-theorem DecreasesOn.failure [Monad m] [LawfulMonad m] :
-    DecreasesOn (α := α) (m:=m) rel failure s := by
-  exists pure (Subtype.mk (none, s) (by simp))
-  simp [Alternative.failure, OptionT.fail, OptionT.mk, Pure.pure, StateT.pure]
-
-theorem DecreasesOn.modify [Monad m] [LawfulMonad m] {rel : σ → σ → Prop} {f : σ → σ} (h : rel (f s) s) :
-    DecreasesOn (m:=m) rel (modify f) s := by
-  exists pure (Subtype.mk (some ⟨⟩, f s) (.inr (.single h)))
-  simp only [_root_.modify, modifyGet, MonadStateOf.modifyGet, monadLift, MonadLift.monadLift,
-    OptionT.lift, OptionT.mk, bind, StateT.bind, StateT.modifyGet, pure, StateT.pure,
-    bind_pure_comp, map_pure]
-
-theorem DecreasesOn.get_then [Monad m] [LawfulMonad m] {rel : σ → σ → Prop}
-    {k : σ → OptionT (StateT σ m) α}
-    (h : DecreasesOn rel (k s) s) : DecreasesOn (m:=m) rel (do let s ← get; k s) s:= by
-  sorry
-
-theorem DecreasesOn.set [Monad m] [LawfulMonad m] {rel : σ → σ → Prop} (h : rel s' s) :
-    DecreasesOn (m:=m) rel (set s') s := by
-  exists pure (Subtype.mk (some ⟨⟩, s') (.inr (.single h)))
-  simp only [MonadStateOf.set, liftM, monadLift, MonadLift.monadLift, OptionT.lift, OptionT.mk,
-    bind, StateT.bind, StateT.set, pure, StateT.pure, bind_pure_comp, map_pure]
-
-/-
-import Std.Data.Iterators
-import Std.Tactic.Do
-
-open Std.Iterators
-open Std.Do
-
-
-def Iterator.step
-    [Monad m]
-    (step : Unit → β → m (ForInStep β))
-    (measure : β → Nat)
-    (it : IterM (α := β) m Unit) :
-    m (IterStep (IterM (α := β) m Unit) Unit) := do
-  match ← step () it.internalState with
-  | ForInStep.done b => .done
-  | ForInStep.yield next =>
-    if measure next < measure it.internalState then
-      .yield ⟨⟨next, it.internalState.upperBound⟩⟩ next
-    else
-      .done
-
-
-
--/
-
-/-
-info: (let x := 0;
-  let y := 0;
-  if true = true then
-    let x := x + 3;
-    pure (x + y)
-  else pure 3).run : Nat
--/
--- #guard_msgs (info) in
-#check Id.run doo
-  let mut x := 0
-  for i in [1,2,3] doo
-    x := x + 3
-    let y := x + x + x
-    return y
-  return x
-
-#check fun i => Id.run doo
-  let mut x := 0
-  if true then
-    x := x + i
-    let y := x + x + x
-    pure y
-  else
-    x := x + 5
-  return x
-
-
-/-
-let mut x := 0
-let mut y := 0
-if b then
-  x := 3
-else
-  y := 5
-return (x + y)
-
-let mut x := 0
-let mut y := 0
-let jp x y := return (x + y)
-if b then
-  let x := 3
-  jp x y
-else
-  let y := 5
-  jp x y
--/
