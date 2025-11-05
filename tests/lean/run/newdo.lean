@@ -800,7 +800,7 @@ Prepare the context for elaborating the body of a loop.
 This includes setting the return continuation, break continuation, continue continuation, as
 well as the changed result type of the `do` block in the loop body.
 -/
-meta def enterLoopBody (resultType : Expr) (returnCont : DoElemCont) (breakCont continueCont : DoElabM Expr) : (body : DoElabM Expr) → DoElabM Expr :=
+meta def enterLoopBody (resultType : Expr) (returnCont : DoElemCont) (breakCont continueCont : DoElabM Expr) : (body : DoElabM α) → DoElabM α :=
   let contInfo := ContInfo.toContInfoRef { breakCont, continueCont, returnCont }
   withReader fun ctx => { ctx with contInfo, doBlockResultType := resultType }
 
@@ -944,6 +944,80 @@ def ControlStack.synthesizePure (m : ControlStack) (resultName : Name) (pureKVar
                               |> mkApp2 (mkConst ``Applicative.toPure [mi.u, mi.v]) mi.m
     m.runInBase <| mkApp4 (mkConst ``Pure.pure [mi.u, mi.v])
       mi.m instPure (← inferType r) r
+
+structure ControlLifter where
+  mutVars : Array Name
+  monadInfo : MonadInfo
+  instMonad : Expr
+  successCont : DoElemCont
+  pureKVar : ContVarId
+  breakKVar : ContVarId
+  continueKVar : ContVarId
+  returnCont : DoElemCont
+  hasEarlyReturn : MetaM Bool
+  resultType : Expr
+
+meta def ControlLifter.mk' (dec : DoElemCont) : DoElabM ControlLifter := do
+  let mi := (← read).monadInfo
+  let oldReturnCont ← getReturnCont
+  -- γ is the result type of the `try` block. It is `stM m (t m)` for whatever `t` is necessary
+  -- to restore reassigned mut vars, early `return`, `break` and `continue`.
+  let γ ← mkFreshResultType `γ
+  let mutVars := (← read).mutVars
+  let pureKVar ← mkFreshContVar γ (mutVars.push dec.resultName)
+  let returnMVar ← mkFreshExprMVar (mkConst ``Unit)
+  let breakKVar ← mkFreshContVar γ mutVars
+  let continueKVar ← mkFreshContVar γ mutVars
+  let ρ := oldReturnCont.resultType
+  let instMonad ← Term.mkInstMVar (mkApp (mkConst ``Monad [mi.u, mi.v]) mi.m)
+  -- We can fill in `returnK` immediately because it does not influence reassigned mut vars
+  let returnCont := { oldReturnCont with k := do
+    -- The following line is purely so that we know whether there was an early return at all
+    discard <| isDefEq returnMVar (mkConst ``Unit.unit)
+    let r ← getFVarFromUserName oldReturnCont.resultName
+    -- TODO: Can we construct γ later on? It must be stM of the transformer stack above
+    -- `EarlyReturnT`.
+    return mkApp5 (mkConst ``EarlyReturnT.return [mi.u, mi.v]) ρ mi.m (← mkFreshResultType `δ) instMonad r }
+  let hasEarlyReturn := returnMVar.mvarId!.isAssigned
+  return { mutVars, monadInfo := mi, instMonad, successCont := dec, pureKVar, breakKVar, continueKVar, returnCont, hasEarlyReturn, resultType := γ }
+
+meta def ControlLifter.withConts (l : ControlLifter) (k : DoElemCont → DoElabM α) : DoElabM α := do
+  let oldBreakCont ← getBreakCont
+  let oldContinueCont ← getContinueCont
+  let breakCont := Functor.mapConst l.breakKVar.mkJump oldBreakCont
+  let continueCont := Functor.mapConst l.continueKVar.mkJump oldContinueCont
+  let returnCont := l.returnCont
+  let contInfo := ContInfo.toContInfoRef { breakCont, continueCont, returnCont }
+  let pureCont := { l.successCont with k := l.pureKVar.mkJump }
+  withReader (fun ctx => { ctx with contInfo, doBlockResultType := l.resultType }) <| k pureCont
+
+meta def ControlLifter.restore (l : ControlLifter) (body : Expr) : DoElabM Expr := do
+  let reassignedMutVars ← do
+    let rootCtx := (← l.resultType.mvarId!.getDecl).lctx
+    let pur ← l.pureKVar.getReassignedMutVars rootCtx
+    let brk ← l.breakKVar.getReassignedMutVars rootCtx
+    let cnt ← l.continueKVar.getReassignedMutVars rootCtx
+    pure <| l.mutVars.filter (pur.union brk |>.union cnt).contains
+  let breakT := (← l.breakKVar.jumpCount) > 0 || (← l.continueKVar.jumpCount) > 0
+  let stateT := reassignedMutVars.size > 0
+  let earlyReturnT ← l.hasEarlyReturn
+  let mut controlStack := ControlStack.base l.monadInfo l.instMonad
+  if earlyReturnT then
+    controlStack := ControlStack.earlyReturnT l.returnCont.resultType controlStack
+  if stateT then
+    let tys ← reassignedMutVars.mapM fun v => return (← getLocalDeclFromUserName v).type
+    let σ ← mkProdN tys
+    controlStack := ControlStack.stateT reassignedMutVars σ controlStack
+  if breakT then
+    let breakStack := ControlStack.breakT controlStack
+    breakStack.synthesizeBreak l.breakKVar
+    breakStack.synthesizeContinue l.continueKVar
+    controlStack := breakStack.toControlStack
+  discard <| isDefEq l.resultType (controlStack.stM l.successCont.resultType)
+
+  controlStack.synthesizePure l.successCont.resultName l.pureKVar
+
+  controlStack.restoreM body l.successCont
 
 /--
 Introduce proxy redefinitions for *all* mut vars and call the continuation `k` with a function
@@ -1164,33 +1238,8 @@ mutual
       -- So we need to pack up our effects and unpack them after the `try`.
       -- We could optimize for the `.last` case by omitting the state tuple ... in the future.
       let mi := (← read).monadInfo
-      let oldReturnCont ← getReturnCont
-      -- γ is the result type of the `try` block. It is `stM m (t m)` for whatever `t` is necessary
-      -- to restore reassigned mut vars, early `return`, `break` and `continue`.
-      let γ ← mkFreshResultType `γ
-      let mutVars := (← read).mutVars
-      let pureKVar ← mkFreshContVar γ (mutVars.push dec.resultName)
-      let returnMVar ← mkFreshExprMVar (mkConst ``Unit)
-      let breakKVar ← mkFreshContVar γ mutVars
-      let continueKVar ← mkFreshContVar γ mutVars
-      let pureK := { dec with k := pureKVar.mkJump }
-      let ρ := oldReturnCont.resultType
-      let instMonad ← Term.mkInstMVar (mkApp (mkConst ``Monad [mi.u, mi.v]) mi.m)
-      -- We can fill in `returnK` immediately because it does not influence reassigned mut vars
-      let returnK := { oldReturnCont with k := do
-        -- The following line is purely so that we know whether there was an early return at all
-        discard <| isDefEq returnMVar (mkConst ``Unit.unit)
-        let r ← getFVarFromUserName oldReturnCont.resultName
-        -- TODO: Can we construct γ later on? It must be stM of the transformer stack above
-        -- `EarlyReturnT`.
-        return mkApp5 (mkConst ``EarlyReturnT.return [mi.u, mi.v]) ρ mi.m (← mkFreshResultType `δ) instMonad r }
-      let breakK := breakKVar.mkJump
-      let continueK := continueKVar.mkJump
-      let withConts k := enterLoopBody γ returnK breakK continueK (k pureK)
-      logInfo m!"before body: {γ}"
-      let body ← withConts (elabElems1 (getDooElems trySeq))
-      logInfo m!"after body: {γ}"
-      logInfo m!"try body: {body}"
+      let lifter ← ControlLifter.mk' dec
+      let body ← lifter.withConts (elabElems1 (getDooElems trySeq))
       let body ← xs.zip (eTypes?.zip catchSeqs) |>.foldlM (init := body) fun body (x, eType?, catchSeq) => do
         let x := Term.mkExplicitBinder x.raw[0] <| match eType? with
           | some eType => eType
@@ -1204,44 +1253,17 @@ mutual
             else
               inferType x
           let uε ← getDecLevel ε
-          let catch_ ← withConts (elabElems1 (getDooElems catchSeq))
+          let catch_ ← lifter.withConts (elabElems1 (getDooElems catchSeq))
           let catch_ ← mkLambdaFVars #[x] catch_
           return (catch_, ε, uε)
         if eType?.isSome then
           let inst ← Term.mkInstMVar <| mkApp2 (mkConst ``MonadExceptOf [uε, mi.u, mi.v]) ε mi.m
           return mkApp6 (mkConst ``tryCatchThe [uε, mi.u, mi.v])
-            ε mi.m inst γ body catch_
+            ε mi.m inst lifter.resultType body catch_
         else
           let inst ← Term.mkInstMVar <| mkApp2 (mkConst ``MonadExcept [uε, mi.u, mi.v]) ε mi.m
           return mkApp6 (mkConst ``MonadExcept.tryCatch [uε, mi.u, mi.v])
-            ε mi.m inst γ body catch_
-      logInfo m!"before control stack stuff: {body}"
-      let reassignedMutVars ← do
-        let rootCtx := (← γ.mvarId!.getDecl).lctx
-        let pur ← pureKVar.getReassignedMutVars rootCtx
-        let brk ← breakKVar.getReassignedMutVars rootCtx
-        let cnt ← continueKVar.getReassignedMutVars rootCtx
-        pure <| mutVars.filter (pur.union brk |>.union cnt).contains
-      let breakT := (← breakKVar.jumpCount) > 0 || (← continueKVar.jumpCount) > 0
-      let stateT := reassignedMutVars.size > 0
-      let earlyReturnT ← returnMVar.mvarId!.isAssigned
-      let mut controlStack := ControlStack.base mi instMonad
-      if earlyReturnT then
-        controlStack := ControlStack.earlyReturnT ρ controlStack
-      if stateT then
-        let tys ← reassignedMutVars.mapM fun v => return (← getLocalDeclFromUserName v).type
-        let σ ← mkProdN tys
-        controlStack := ControlStack.stateT reassignedMutVars σ controlStack
-      if breakT then
-        let breakStack := ControlStack.breakT controlStack
-        breakStack.synthesizeBreak breakKVar
-        breakStack.synthesizeContinue continueKVar
-        controlStack := breakStack.toControlStack
-      discard <| isDefEq γ (controlStack.stM dec.resultType)
-      logInfo m!"γ: {γ}"
-
-      controlStack.synthesizePure pureK.resultName pureKVar
-
+            ε mi.m inst lifter.resultType body catch_
       let body ← match finSeq? with
         | none => pure body
         | some finSeq => do
@@ -1250,9 +1272,9 @@ mutual
           let instMonadFinally ← Term.mkInstMVar <| mkApp (mkConst ``MonadFinally [mi.u, mi.v]) mi.m
           let instFunctor ← Term.mkInstMVar <| mkApp (mkConst ``Functor [mi.u, mi.v]) mi.m
           pure <| mkApp7 (mkConst ``tryFinally [mi.u, mi.v])
-            mi.m γ β instMonadFinally instFunctor body fin
+            mi.m lifter.resultType β instMonadFinally instFunctor body fin
 
-      controlStack.restoreM body dec
+      lifter.restore body
     | _ => throwError "unexpected do element {dooElem}, {repr dooElem}"
 
   meta def elabElems1 (dooElems : Array (TSyntax `dooElem)) (k : DoElemCont) : DoElabM Expr := do
