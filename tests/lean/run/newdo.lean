@@ -21,20 +21,41 @@ def ExceptT.runK [Monad m] (x : ExceptT ε m α) (ok : α → m β) (error : ε 
 def ExceptT.runCatch [Monad m] (x : ExceptT α m α) : m α :=
   x.runK pure pure
 
-abbrev EarlyReturnT := ExceptT
-abbrev EarlyReturnT.return {m : Type w → Type x} [Monad m] : ρ → EarlyReturnT ρ m α := throw
+abbrev EarlyReturn.{u} := Except.{u, u}
+abbrev EarlyReturn.return {m : Type w → Type x} [Monad m] (r : ρ) : m (EarlyReturn ρ α) :=
+  pure (Except.error r)
+abbrev EarlyReturn.pure {m : Type w → Type x} [Monad m] (a : α) : m (EarlyReturn ρ α) :=
+  Pure.pure (Except.ok a)
 
-abbrev BreakT := OptionT
-abbrev BreakT.break {m : Type w → Type x} [Monad m] : BreakT (StateT σ (EarlyReturnT ρ m)) PUnit := throw ()
-abbrev BreakT.continue {m : Type w → Type x} [Monad m] : BreakT (StateT σ (EarlyReturnT ρ m)) PUnit := pure ⟨⟩
+abbrev EarlyReturnT (ρ m α) := ExceptT ρ m α
+abbrev EarlyReturnT.return {ρ m α} [Monad m] (r : ρ) : EarlyReturnT ρ m α :=
+  throw r
+abbrev EarlyReturnT.runK {ρ m α β} [Monad m] (x : EarlyReturnT ρ m α) (kreturn : ρ → m β) (kpure : α → m β) : m β :=
+  ExceptT.runK x kpure kreturn
 
-inductive BreakContinue where
+abbrev EarlyReturn.runK {ρ α : Type u} {β : Type v} (x : Except ρ α) (ret : ρ → β) (pure : α → β) : β :=
+  x.casesOn ret pure
+
+inductive BreakContinue : Type u where
   | break
   | continue
 
-inductive LetMuts
+abbrev Break.{u} := Except.{u, u} BreakContinue
+abbrev Break.break {m : Type w → Type x} [Monad m] : m (Break α) :=
+  pure (Except.error .break)
+abbrev Break.continue {m : Type w → Type x} [Monad m] : m (Break α) :=
+  pure (Except.error .continue)
+abbrev Break.pure {m : Type w → Type x} [Monad m] (a : α) : m (Break α) :=
+  Pure.pure (Except.ok a)
 
-inductive EarlyReturn
+abbrev BreakT := ExceptT BreakContinue
+abbrev BreakT.break {m : Type w → Type x} [Monad m] : BreakT m PUnit := throw .break
+abbrev BreakT.continue {m : Type w → Type x} [Monad m] : BreakT m PUnit := throw .continue
+
+abbrev Break.runK {α : Type u} {β : Type v} (x : Except BreakContinue.{u} α) (breakK : Unit → β) (continueK : Unit → β) (successK : α → β) : β :=
+  x.casesOn (·.casesOn (breakK ()) (continueK ())) successK
+
+inductive LetMuts
 
 /-- info: fun α => Except EarlyReturn (Except BreakContinue α × LetMuts) -/
 #guard_msgs in
@@ -105,8 +126,8 @@ def Foldable.forBreak_ {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type w 
       let e ← body a s
       match e with
       | .error r => kreturn r
-      | .ok (.some _, s) => acc s
-      | .ok (none, s) => kbreak s)
+      | .ok (.error .break, s) => kbreak s
+      | .ok (_, s) => acc s)
     kbreak
     xs
     s
@@ -256,20 +277,11 @@ structure Context where
   monadInfo : MonadInfo
   /-- The mutable variables in declaration order. -/
   mutVars : Array Name := #[]
-  /-- The expected type of `e` in `return e`. -/
-  earlyReturnType : Expr
   /--
   The expected type of the current `do` block.
   This can be different from `earlyReturnType` in `for` loop `do` blocks, for example.
   -/
   doBlockResultType : Expr
-  -- /-- The continuation for an early `return`. -/
-  -- returnCont : ContInfo
-  --/--
-  --The success continuation of type `α → m α` for expected result type `α` for regular exit of
-  --the `do` sequence.
-  ---/
-  --successCont : Expr → Expr
   contInfo : ContInfoRef
 
 structure MonadInstanceCache where
@@ -336,11 +348,41 @@ structure State where
 abbrev DoElabM := ReaderT Context <| StateRefT State TermElabM
 
 /--
+Elaboration of a `do` block `do $e; $rest`, results in a call
+``elabTerm `(do $e; $rest) = elabElem e dec``, where `elabElem e ·` is the elaborator for `do`
+`e`, and `dec` is the `DoElemCont` describing the elaboration of the rest of the block `rest`.
+
+If the semantics of `e` resumes its continuation `rest`, its elaborator must bind its result to
+`resultName`, ensure that it has type `resultType` and then elaborate `rest` using `dec`.
+
+Clearly, for term elements `e : m α`, the result has type `α`.
+More subtly, for binding elements `let x := e` or `let x ← e`, the result has type `PUnit` and is
+unrelated to the type of the bound variable `x`.
+
+Examples:
+* `return` drops the continuation; `return x; pure ()` elaborates to `pure x`.
+* `let x ← e; rest x` elaborates to `e >>= fun x => rest x`.
+* `let x := 3; let y ← (let x ← e); rest x` elaborates to
+  `let x := 3; e >>= fun x_1 => let y := (); rest x`, which is immediately zeta-reduced to
+  `let x := 3; e >>= fun x_1 => rest x`.
+* `one; two` elaborates to `one >>= fun (_ : PUnit) => two`; it is an error if `one` does not have
+  type `PUnit`.
+-/
+structure DoElemCont where
+  /-- The name of the monadic result variable. -/
+  resultName : Name
+  /-- The type of the monadic result. -/
+  resultType : Expr
+  /-- The continuation to elaborate the `rest` of the block. -/
+  k : DoElabM Expr
+deriving Inhabited
+
+/--
 Information about a success, `return`, `break` or `continue` continuation that will be filled in
 after the code using it has been elaborated.
 -/
 structure ContInfo where
-  returnCont : Expr → DoElabM Expr
+  returnCont : DoElemCont
   breakCont : Option (DoElabM Expr) := none
   continueCont : Option (DoElabM Expr) := none
 deriving Inhabited
@@ -384,12 +426,17 @@ meta def mkPureApp (α e : Expr) : DoElabM Expr := do
   let e ← Term.ensureHasType α e
   return mkApp2 (← getCachedPure) α e
 
+/-- Create a `DoElemCont` returning the result using `pure`. -/
+meta def DoElemCont.mkPure (resultType : Expr) : TermElabM DoElemCont := do
+  let r ← mkFreshUserName `r
+  return { resultName := r, resultType, k := do mkPureApp resultType (← getFVarFromUserName r) }
+
 /-- Create the `Context` for `do` elaboration from the given expected type of a `do` block. -/
 meta def mkContext (expectedType? : Option Expr) : TermElabM Context := do
   let (mi, resultType) ← extractMonadInfo expectedType?
-  let returnCont e := do mkPureApp resultType e
+  let returnCont ← DoElemCont.mkPure resultType
   let contInfo := ContInfo.toContInfoRef { returnCont }
-  return { monadInfo := mi, earlyReturnType := resultType, doBlockResultType := resultType, contInfo }
+  return { monadInfo := mi, doBlockResultType := resultType, contInfo }
 
 /-- The cached `@Bind.bind m instBind` expression. -/
 meta def getCachedBind : DoElabM Expr := do
@@ -441,9 +488,7 @@ meta def mkBindCancellingPure (x : Name) (eResultTy e : Expr) (k : Expr → DoEl
     let body' := body.consumeMData
     if body'.isAppOfArity ``Pure.pure 4 && body'.getArg! 3 == x then
       return e
-    let bodyTy ← inferType body
-    let .app _m kResultTy := bodyTy
-      | throwError "Expected some monadic type for{indentExpr body}\nbut got{indentExpr bodyTy}"
+    let kResultTy ← mkFreshResultType `kResultTy
     let k ← mkLambdaFVars #[x] body
     mkBindApp eResultTy kResultTy e k
 
@@ -477,15 +522,15 @@ meta def _root_.Lean.LocalContext.findFromUserNames (lctx : LocalContext) (userN
     return acc
 
 /--
-The subset of `(← read).mutVars` that were reassigned in any of the `childCtxs` relative to the
-given `rootCtx`. The result array has the same order as `(← read).mutVars`.
+The subset of `mutVars` that were reassigned in any of the `childCtxs` relative to the given
+`rootCtx`.
 -/
-meta def getReassignedMutVars (rootCtx : LocalContext) (mutVars : Array Name) (childCtxs : Array LocalContext) : Array Name := Id.run do
+meta def _root_.Lean.LocalContext.getReassignedMutVars (rootCtx : LocalContext) (mutVars : Std.HashSet Name) (childCtxs : Array LocalContext) : Std.HashSet Name := Id.run do
   let mut reassignedMutVars := Std.HashSet.emptyWithCapacity mutVars.size
   for childCtx in childCtxs do
-    let newDefs := childCtx.findFromUserNames (.ofArray mutVars) (start := rootCtx.numIndices)
+    let newDefs := childCtx.findFromUserNames mutVars (start := rootCtx.numIndices)
     reassignedMutVars := reassignedMutVars.insertMany (newDefs.map (·.userName))
-  return mutVars.filter reassignedMutVars.contains
+  return reassignedMutVars
 
 /--
 Adds the new reaching definitions of the given `tunneledVars` in `childCtx` relative to `rootCtx` as
@@ -550,10 +595,10 @@ meta def ContVarId.erase (contVarId : ContVarId) : DoElabM Unit := do
 The subset of `(← read).mutVars` that were reassigned at any of the jump sites of the continuation
 variable. The result array has the same order as `(← read).mutVars`.
 -/
-meta def ContVarId.getReassignedMutVars (contVarId : ContVarId) (rootCtx : LocalContext) : DoElabM (Array Name) := do
+meta def ContVarId.getReassignedMutVars (contVarId : ContVarId) (rootCtx : LocalContext) : DoElabM (Std.HashSet Name) := do
   let info ← contVarId.find
-  let mvarDecls ← info.jumps.mapM (·.mvar.mvarId!.getDecl)
-  return Do.getReassignedMutVars rootCtx (← read).mutVars (mvarDecls.map (·.lctx))
+  let childCtxs ← info.jumps.mapM fun j => return (← j.mvar.mvarId!.getDecl).lctx
+  return rootCtx.getReassignedMutVars (.ofArray (← read).mutVars) childCtxs
 
 /--
 Restores the local context to `oldCtx` and adds the new reaching definitions of the mut vars and
@@ -590,40 +635,6 @@ meta def withLCtxKeepingMutVarDefs (oldCtx : LocalContext) (oldMutVars : Array N
   withLCtx' newCtx <| withReader (fun ctx => { ctx with mutVars := oldMutVars }) k
 
 /--
-Elaboration of a `do` block `do $e; $rest`, results in a call
-``elabTerm `(do $e; $rest) = elabElem e dec``, where `elabElem e ·` is the elaborator for `do`
-`e`, and `dec` is the `DoElemCont` describing the elaboration of the rest of the block `rest`.
-
-If the semantics of `e` resumes its continuation `rest`, its elaborator must bind its result to
-`resultName`, ensure that it has type `resultType` and then elaborate `rest` using `dec`.
-
-Clearly, for term elements `e : m α`, the result has type `α`.
-More subtly, for binding elements `let x := e` or `let x ← e`, the result has type `PUnit` and is
-unrelated to the type of the bound variable `x`.
-
-Examples:
-* `return` drops the continuation; `return x; pure ()` elaborates to `pure x`.
-* `let x ← e; rest x` elaborates to `e >>= fun x => rest x`.
-* `let x := 3; let y ← (let x ← e); rest x` elaborates to
-  `let x := 3; e >>= fun x_1 => let y := (); rest x`, which is immediately zeta-reduced to
-  `let x := 3; e >>= fun x_1 => rest x`.
-* `one; two` elaborates to `one >>= fun (_ : PUnit) => two`; it is an error if `one` does not have
-  type `PUnit`.
--/
-structure DoElemCont where
-  /-- The name of the monadic result variable. -/
-  resultName : Name
-  /-- The type of the monadic result. -/
-  resultType : Expr
-  /-- The continuation to elaborate the `rest` of the block. -/
-  k : DoElabM Expr
-
-/-- Create a `DoElemCont` returning the result using `pure`. -/
-meta def DoElemCont.mkPure (resultType : Expr) : TermElabM DoElemCont := do
-  let r ← mkFreshUserName `r
-  return { resultName := r, resultType, k := do mkPureApp resultType (← getFVarFromUserName r) }
-
-/--
 Return `$e >>= fun ($dec.resultName : $dec.resultType) => $(← dec.k)`, cancelling
 the bind if `$(← dec.k)` is `pure $dec.resultName`.
 -/
@@ -631,9 +642,9 @@ meta def DoElemCont.mkBindUnlessPure (dec : DoElemCont) (e : Expr) : DoElabM Exp
   mkBindCancellingPure dec.resultName dec.resultType e (fun _ => dec.k)
 
 /-- Has the effect of ``let x : ty := rhs; $(← k `(x))`` and then zeta-reducing the expression. -/
-meta def withInlinedLetDecl (name : Name) (type rhs : Expr) (k : DoElabM Expr) : DoElabM Expr := do
+meta def mapLetDeclZeta (name : Name) (type rhs : Expr) (k : Expr → DoElabM Expr) : DoElabM Expr := do
   withLetDecl name type rhs fun x => do
-    let e ← k
+    let e ← k x
     let e ← elimMVarDeps #[x] e
     return e.replaceFVar x rhs
 
@@ -644,7 +655,7 @@ is `PUnit` and then immediately zeta-reduce the `let`.
 meta def DoElemCont.continueWithUnit (dec : DoElemCont) : DoElabM Expr := do
   let unit ← mkPUnitUnit
   discard <| Term.ensureHasType dec.resultType unit
-  withInlinedLetDecl dec.resultName (← mkPUnit) unit dec.k
+  mapLetDeclZeta dec.resultName (← mkPUnit) unit (fun _ => dec.k)
 
 /--
 Call `caller` with a duplicable proxy of `dec`.
@@ -681,6 +692,7 @@ meta def DoElemCont.withDuplicableCont (nondupDec : DoElemCont) (caller : DoElem
       -- of the join point. We take a little care to preserve the declaration order that is manifest
       -- in the array `(← read).mutVars`.
       let reassignedMutVars ← contVarId.getReassignedMutVars (← joinRhs.mvarId!.getDecl).lctx
+      let reassignedMutVars := mutVars.filter reassignedMutVars.contains
 
       -- Assign the `joinTy` based on the types of the reassigned mut vars and the result type.
       let reassignedDecls ← reassignedMutVars.mapM (getLocalDeclFromUserName ·)
@@ -705,6 +717,23 @@ meta def DoElemCont.withDuplicableCont (nondupDec : DoElemCont) (caller : DoElem
 
     mkLetFVars #[jp] (usedLetOnly := true) (← Term.ensureHasType mα e)
 
+/-- Given types `tᵢ`, return the tuple type `t₁ × t₂ × … × tₙ`. -/
+meta def mkProdN (ts : Array Expr) : MetaM Expr := do
+  if h : ts.size > 0 then
+    let mut tupleTy := ts.back
+    let mut u ← getDecLevel tupleTy
+    let mut ts := ts.pop
+    for i in 0...ts.size do
+      let ty := ts.back!
+      let u' ← getDecLevel ty
+      tupleTy := mkApp2 (mkConst ``Prod [u', u]) ty tupleTy
+      u := (mkLevelMax u u').normalize
+      ts := ts.pop
+    return tupleTy
+  else
+    let u ← mkFreshLevelMVar
+    return mkConst ``PUnit [u]
+
 /-- Given expressions `eᵢ`, return the tuple `(e₁, e₂, …, eₙ)` and its type `t₁ × t₂ × … × tₙ`. -/
 meta def mkProdMkN (es : Array Expr) : MetaM (Expr × Expr) := do
   if h : es.size > 0 then
@@ -713,9 +742,10 @@ meta def mkProdMkN (es : Array Expr) : MetaM (Expr × Expr) := do
     let mut u ← getDecLevel tupleTy
     let mut es := es.pop
     for i in 0...es.size do
-      let ty ← inferType es[es.size - i - 1]!
+      let e := es.back!
+      let ty ← inferType e
       let u' ← getDecLevel ty
-      tuple := mkApp4 (mkConst ``Prod.mk [u', u]) ty tupleTy es[es.size - i - 1]! tuple
+      tuple := mkApp4 (mkConst ``Prod.mk [u', u]) ty tupleTy e tuple
       tupleTy := mkApp2 (mkConst ``Prod [u', u]) ty tupleTy
       u := (mkLevelMax u u').normalize
       es := es.pop
@@ -756,12 +786,21 @@ where
       withLetDecl (← tupleVar.getUserName) sndTy snd fun r => do
         go xs r.fvarId! sndTy (letFVars |>.push x |>.push r)
 
+meta def getReturnCont : DoElabM DoElemCont := do
+  return (← read).contInfo.toContInfo.returnCont
+
+meta def getBreakCont : DoElabM (Option (DoElabM Expr)) := do
+  return (← read).contInfo.toContInfo.breakCont
+
+meta def getContinueCont : DoElabM (Option (DoElabM Expr)) := do
+  return (← read).contInfo.toContInfo.continueCont
+
 /--
 Prepare the context for elaborating the body of a loop.
 This includes setting the return continuation, break continuation, continue continuation, as
 well as the changed result type of the `do` block in the loop body.
 -/
-meta def enterLoopBody (resultType : Expr) (returnCont : Expr → DoElabM Expr) (breakCont continueCont : DoElabM Expr) : (body : DoElabM Expr) → DoElabM Expr :=
+meta def enterLoopBody (resultType : Expr) (returnCont : DoElemCont) (breakCont continueCont : DoElabM Expr) : (body : DoElabM Expr) → DoElabM Expr :=
   let contInfo := ContInfo.toContInfoRef { breakCont, continueCont, returnCont }
   withReader fun ctx => { ctx with contInfo, doBlockResultType := resultType }
 
@@ -769,11 +808,142 @@ meta def enterLoopBody (resultType : Expr) (returnCont : Expr → DoElabM Expr) 
 Prepare the context for elaborating the body of a `finally` block.
 There is no support for `mut` vars, `break`, `continue` or `return` in a `finally` block.
 -/
-meta def enterFinally (resultType : Expr) : (body : DoElabM Expr) → DoElabM Expr :=
+meta def enterFinally (resultType : Expr) (k : DoElabM Expr) : DoElabM Expr := do
   let error := throwError "`finally` does not support `break`, `continue` or `return`."
-  let contInfo := { breakCont := error, continueCont := error, returnCont := fun _ => error : ContInfo}
+  let dec ← getReturnCont
+  let contInfo := { breakCont := error, continueCont := error, returnCont := { dec with k := error }}
   let contInfo := ContInfo.toContInfoRef contInfo
-  withReader fun ctx => { ctx with contInfo, doBlockResultType := resultType }
+  withReader (fun ctx => { ctx with contInfo, doBlockResultType := resultType }) k
+
+structure ControlStack where
+  monadInfo : MonadInfo
+  instMonad : Expr
+  stM : Expr → Expr
+  runInBase : Expr → DoElabM Expr
+  restoreM : Expr → DoElemCont → DoElabM Expr
+
+def ControlStack.base (mi : MonadInfo) (instMonad : Expr) : ControlStack where
+  monadInfo := mi
+  instMonad := instMonad
+  stM α := α
+  runInBase e := pure e
+  restoreM e dec := dec.mkBindUnlessPure e
+
+def ControlStack.stateT (reassignedMutVars : Array Name) (σ : Expr) (m : ControlStack) : ControlStack where
+  monadInfo :=
+    { mi with m := mkApp2 (mkConst ``StateT [mi.u, mi.v]) σ mi.m }
+  instMonad :=
+    mkApp3 (mkConst ``StateT.instMonad [mi.u, mi.v]) σ mi.m m.instMonad
+  stM := m.stM ∘ stM
+  runInBase e := do
+    -- `e : StateT σ m α`. Fetch the state tuple `s : σ` and apply it to `e`, `e.run s`.
+    -- See also `StateT.monadControl.liftWith`.
+    let (tuple, _tupleTy) ← mkProdMkN (← reassignedMutVars.mapM (getFVarFromUserName ·))
+    let tuple ← Term.ensureHasType σ tuple
+    return mkApp e tuple
+  restoreM e dec := do
+    -- `e : m (α × σ)`. Restore in the base monad `m` with a continuation that unpacks the tuple
+    -- before calling `dec.k`. See also `StateT.monadControl.restoreM`.
+    let resultName ← mkFreshUserName `p
+    let resultType := stM dec.resultType
+    let k := do
+      let p ← getFVarFromUserName resultName
+      bindMutVarsFromTuple (dec.resultName :: reassignedMutVars.toList) p.fvarId! do
+        dec.k
+    m.restoreM e { resultName, resultType, k }
+where
+  mi := m.monadInfo
+  stM α := mkApp2 (mkConst ``Prod [mi.u, mi.u]) α σ
+
+def ControlStack.earlyReturnT (ρ : Expr) (m : ControlStack) : ControlStack where
+  monadInfo :=
+    { mi with m := mkApp2 (mkConst ``EarlyReturnT [mi.u, mi.v]) ρ mi.m }
+  instMonad :=
+    mkApp3 (mkConst ``ExceptT.instMonad [mi.u, mi.v]) ρ mi.m m.instMonad
+  stM := m.stM ∘ stM
+  runInBase e := do
+    -- `e : EarlyReturnT ρ m α`. Return `e`, which is defeq to `ExceptT.run e`.
+    -- See also `instMonadControlExceptTOfMonad.liftWith`.
+    return e
+  restoreM e dec := do
+    -- `e : m (Except ρ α)`. Restore in the base monad `m` with a continuation that unpacks the
+    -- Except before calling `dec.k`. See also `instMonadControlExceptTOfMonad.restoreM`.
+    let resultName ← mkFreshUserName `e
+    logInfo m!"e: {e}"
+    logInfo m!"dec.resultType: {dec.resultType}"
+    let resultType := stM dec.resultType
+    logInfo m!"resultType: {resultType}"
+    let k := do
+      let e ← getFVarFromUserName resultName
+      let outerReturnCont ← getReturnCont
+      logInfo m!"outerReturnCont: {outerReturnCont.resultName}, {outerReturnCont.resultType}"
+      let kreturn ← withLocalDeclD outerReturnCont.resultName outerReturnCont.resultType fun r => do
+        mkLambdaFVars #[r] (← outerReturnCont.k)
+      logInfo m!"kreturn: {kreturn}"
+      let ksuccess ← withLocalDeclD dec.resultName dec.resultType fun r => do
+        mkLambdaFVars #[r] (← dec.k)
+      logInfo m!"kreturn: {kreturn}, ksuccess: {ksuccess}"
+      let β ← mkMonadicType (← read).doBlockResultType
+      return mkApp6 (mkConst ``EarlyReturn.runK [mi.u, mi.v]) ρ dec.resultType β e kreturn ksuccess
+    m.restoreM e { resultName, resultType, k }
+where
+  mi := m.monadInfo
+  stM α := mkApp2 (mkConst ``Except [mi.u, mi.u]) ρ α
+
+structure BreakControlStack extends ControlStack where
+  synthesizeBreak : ContVarId → DoElabM Unit
+  synthesizeContinue : ContVarId → DoElabM Unit
+
+def ControlStack.breakT (m : ControlStack) : BreakControlStack where
+  monadInfo :=
+    { mi with m := mkApp (mkConst ``BreakT [mi.u, mi.v]) mi.m }
+  instMonad :=
+    mkApp3 (mkConst ``ExceptT.instMonad [mi.u, mi.v]) bc mi.m m.instMonad
+  stM := m.stM ∘ stM
+  runInBase e := do
+    -- `e : BreakT m α`. Return `e`, which is defeq to `ExceptT.run e`.
+    -- See also `instMonadControlExceptTOfMonad.liftWith`.
+    return e
+  restoreM e dec := do
+    -- `e : m (Except BreakContinue α)`. Restore in the base monad `m` with a continuation that
+    -- unpacks the Except before calling `dec.k`. See also `instMonadControlExceptTOfMonad.restoreM`.
+    let resultName ← mkFreshUserName `e
+    let resultType := stM dec.resultType
+    let k := do
+      let e ← getFVarFromUserName resultName
+      let some outerBreakCont ← getBreakCont
+        | throwError "`break` must be nested inside a loop"
+      let some outerContinueCont ← getContinueCont
+        | throwError "`continue` must be nested inside a loop"
+      let kbreak ← withLocalDeclD (← mkFreshUserName `r) (mkConst ``Unit) fun r => do
+        mkLambdaFVars #[r] (← outerBreakCont)
+      let kcontinue ← withLocalDeclD (← mkFreshUserName `r) (mkConst ``Unit) fun r => do
+        mkLambdaFVars #[r] (← outerContinueCont)
+      let ksuccess ← withLocalDeclD dec.resultName dec.resultType fun r => do
+        mkLambdaFVars #[r] (← dec.k)
+      let β ← mkMonadicType (← read).doBlockResultType
+      return mkApp6 (mkConst ``Break.runK [mi.u, mi.v]) dec.resultType β e kbreak kcontinue ksuccess
+    m.restoreM e { resultName, resultType, k }
+  synthesizeBreak kvar := do
+    kvar.synthesizeJumps do
+      m.runInBase <| mkApp2 (mkConst ``BreakT.break [mi.u, mi.v]) mi.m m.instMonad
+  synthesizeContinue kvar := do
+    kvar.synthesizeJumps do
+      m.runInBase <| mkApp2 (mkConst ``BreakT.continue [mi.u, mi.v]) mi.m m.instMonad
+where
+  mi := m.monadInfo
+  bc := mkConst ``BreakContinue [mi.u]
+  stM α := mkApp2 (mkConst ``Except [mi.u, mi.u]) bc α
+
+def ControlStack.synthesizePure (m : ControlStack) (resultName : Name) (pureKVar : ContVarId) : DoElabM Unit := do
+  pureKVar.synthesizeJumps do
+    let r ← getFVarFromUserName resultName
+    let mi := m.monadInfo
+    let instMonad := m.instMonad
+    let instPure := instMonad |> mkApp2 (mkConst ``Monad.toApplicative [mi.u, mi.v]) mi.m
+                              |> mkApp2 (mkConst ``Applicative.toPure [mi.u, mi.v]) mi.m
+    m.runInBase <| mkApp4 (mkConst ``Pure.pure [mi.u, mi.v])
+      mi.m instPure (← inferType r) r
 
 /--
 Introduce proxy redefinitions for *all* mut vars and call the continuation `k` with a function
@@ -800,23 +970,15 @@ meta def withProxyMutVarDefs [Inhabited α] (k : (Expr → MetaM Expr) → DoEla
       return e.replaceFVars proxyDefs actualDefs
     k elimProxyDefs
 
-meta def getReturnCont : DoElabM (Expr → DoElabM Expr) := do
-  return (← read).contInfo.toContInfo.returnCont
-
-meta def getBreakCont : DoElabM (Option (DoElabM Expr)) := do
-  return (← read).contInfo.toContInfo.breakCont
-
-meta def getContinueCont : DoElabM (Option (DoElabM Expr)) := do
-  return (← read).contInfo.toContInfo.continueCont
-
 mutual
   meta def elabElem (dooElem : TSyntax `dooElem) (dec : DoElemCont) : DoElabM Expr := withRef dooElem do
     match dooElem with
     -- First off the three constructs that discard the continuation `k`:
     | `(dooElem| return $e) =>
-      let e ← Term.elabTermEnsuringType e (← read).earlyReturnType
       let returnCont ← getReturnCont
-      returnCont e
+      let e ← Term.elabTermEnsuringType e returnCont.resultType
+      mapLetDeclZeta returnCont.resultName returnCont.resultType e fun _ =>
+        returnCont.k
     | `(dooElem| break) =>
       let some breakCont := (← getBreakCont)
         | throwError "`break` must be nested inside a loop"
@@ -880,16 +1042,17 @@ mutual
       let instMonad ← Term.mkInstMVar (mkApp (mkConst ``Monad [mi.u, mi.v]) mi.m)
       let σ ← mkFreshExprMVar (mkSort (mkLevelSucc mi.u)) (userName := `σ)
       let preS ← mkFreshExprMVar σ (userName := `s)
-      let ε := (← read).earlyReturnType
+      let returnCont ← getReturnCont
+      let ε := returnCont.resultType
       let γ := (← read).doBlockResultType
       let (body, preS, reassignedMutVars) ←
         withLocalDeclD x.getId α fun x => do
         withLocalDeclD (← mkFreshUserName `s) σ fun loopS => do
           -- result type is
-          -- Except ε (Option PUnit × σ)
-          let o := mkApp (mkConst ``Option [mi.u]) (← mkPUnit)
-          let oσ := mkApp2 (mkConst ``Prod [mi.u, mi.u]) o σ
-          let eoσ := mkApp2 (mkConst ``Except [mi.u, mi.u]) ε oσ
+          -- Except ε (Except BreakContinue × σ)
+          let bc := mkApp2 (mkConst ``Except [mi.u, mi.u]) (mkConst ``BreakContinue [mi.u]) (← mkPUnit)
+          let bcσ := mkApp2 (mkConst ``Prod [mi.u, mi.u]) bc σ
+          let ebcσ := mkApp2 (mkConst ``Except [mi.u, mi.u]) ε bcσ
           let mutVars := (← read).mutVars
 
           -- Introduce proxy FVs for *all* mut vars. `elimProxyDefs` will later on replace them with
@@ -902,15 +1065,17 @@ mutual
 
           -- We need to delay filling in continueK and breakK because they take a `σ` tuple
           let loopBodyCtx ← getLCtx
-          let continueK ← mkFreshContVar eoσ mutVars
-          let breakK ← mkFreshContVar eoσ mutVars
-          let returnK (e : Expr) : DoElabM Expr := do
-            -- We can fill in `returnK` now because it does not depend on `σ`
-            let e ← Term.ensureHasType ε e
-            return mkApp5 (mkConst ``EarlyReturnT.return [mi.u, mi.v]) ε oσ mi.m instMonad e
+          let continueK ← mkFreshContVar ebcσ mutVars
+          let breakK ← mkFreshContVar ebcσ mutVars
+          let returnMVar ← mkFreshExprMVar (mkConst ``Unit)
+          let returnK := { returnCont with k := do
+            -- The following line is purely so that we know whether there was an early return at all
+            discard <| isDefEq returnMVar (mkConst ``Unit.unit)
+            let r ← getFVarFromUserName returnCont.resultName
+            return mkApp5 (mkConst ``EarlyReturnT.return [mi.u, mi.v]) ε mi.m bcσ instMonad r }
 
           -- Elaborate the loop body.
-          let block ← enterLoopBody eoσ returnK breakK.mkJump continueK.mkJump do
+          let block ← enterLoopBody ebcσ returnK breakK.mkJump continueK.mkJump do
             let n ← mkFreshUserName `r
             elabElems1 (getDooElems dooSeq) (.mk n (← mkPUnit) continueK.mkJump)
 
@@ -919,7 +1084,7 @@ mutual
           let reassignedMutVars ← do
             let cont ← continueK.getReassignedMutVars loopBodyCtx
             let brk ← breakK.getReassignedMutVars loopBodyCtx
-            pure (mutVars.filter (cont ++ brk).contains)
+            pure <| mutVars.filter (cont.union brk).contains
 
           -- Assign the state tuple type and the initial tuple of states.
           let preS ← σ.mvarId!.withContext do
@@ -929,14 +1094,17 @@ mutual
             pure tuple
 
           -- Synthesize the `break` and `continue` jumps.
+          let m' := mi.m |> mkApp2 (mkConst ``EarlyReturnT [mi.u, mi.v]) ε
+                         |> mkApp2 (mkConst ``StateT [mi.u, mi.v]) σ
+          let instMonad ← Term.mkInstMVar (mkApp (mkConst ``Monad [mi.u, mi.v]) m')
           continueK.synthesizeJumps do
             let (tuple, _tupleTy) ← mkProdMkN (← reassignedMutVars.mapM (getFVarFromUserName ·))
             let tuple ← Term.ensureHasType σ tuple
-            return mkApp5 (mkConst ``BreakT.continue [mi.u, mi.v]) σ ε mi.m instMonad tuple
+            return mkApp3 (mkConst ``BreakT.continue [mi.u, mi.v]) m' instMonad tuple
           breakK.synthesizeJumps do
             let (tuple, _tupleTy) ← mkProdMkN (← reassignedMutVars.mapM (getFVarFromUserName ·))
             let tuple ← Term.ensureHasType σ tuple
-            return mkApp5 (mkConst ``BreakT.break [mi.u, mi.v]) σ ε mi.m instMonad tuple
+            return mkApp3 (mkConst ``BreakT.break [mi.u, mi.v]) m' instMonad tuple
 
           let block ← bindMutVarsFromTuple reassignedMutVars.toList loopS.fvarId! do
             -- Replace the proxy variables with their actual definitions, as if we never introduced
@@ -946,9 +1114,8 @@ mutual
 
           return (body, preS, reassignedMutVars)
 
-      let kreturn ← withLocalDeclD (← mkFreshUserName `r) ε fun r => do mkLambdaFVars #[r] <| ← do
-        let k ← getReturnCont
-        k r
+      let kreturn ← withLocalDeclD returnCont.resultName ε fun r => do
+        mkLambdaFVars #[r] (← returnCont.k)
       let kafter ← withLocalDeclD (← mkFreshUserName `s) σ fun postS => do mkLambdaFVars #[postS] <| ← do
         bindMutVarsFromTuple reassignedMutVars.toList postS.fvarId! do
           let k ← dec.continueWithUnit
@@ -997,26 +1164,33 @@ mutual
       -- So we need to pack up our effects and unpack them after the `try`.
       -- We could optimize for the `.last` case by omitting the state tuple ... in the future.
       let mi := (← read).monadInfo
-      let α := dec.resultType
+      let oldReturnCont ← getReturnCont
       -- γ is the result type of the `try` block. It is `stM m (t m)` for whatever `t` is necessary
       -- to restore reassigned mut vars, early `return`, `break` and `continue`.
-      let γ ← mkFreshExprMVar (mkSort (mkLevelSucc mi.u)) (userName := `γ)
-      let rName ← mkFreshUserName `r
+      let γ ← mkFreshResultType `γ
       let mutVars := (← read).mutVars
-      let pureKVar ← mkFreshContVar γ mutVars
-      let pureK := DoElemCont.mk rName α pureKVar.mkJump
-      let returnKVar ← mkFreshContVar γ mutVars
-      let ρ := (← read).earlyReturnType
-      let returnK (e : Expr) : DoElabM Expr := do
-        return mkApp (← returnKVar.mkJump) (← Term.ensureHasType ρ e)
+      let pureKVar ← mkFreshContVar γ (mutVars.push dec.resultName)
+      let returnMVar ← mkFreshExprMVar (mkConst ``Unit)
       let breakKVar ← mkFreshContVar γ mutVars
-      let breakK := breakKVar.mkJump
       let continueKVar ← mkFreshContVar γ mutVars
+      let pureK := { dec with k := pureKVar.mkJump }
+      let ρ := oldReturnCont.resultType
+      let instMonad ← Term.mkInstMVar (mkApp (mkConst ``Monad [mi.u, mi.v]) mi.m)
+      -- We can fill in `returnK` immediately because it does not influence reassigned mut vars
+      let returnK := { oldReturnCont with k := do
+        -- The following line is purely so that we know whether there was an early return at all
+        discard <| isDefEq returnMVar (mkConst ``Unit.unit)
+        let r ← getFVarFromUserName oldReturnCont.resultName
+        -- TODO: Can we construct γ later on? It must be stM of the transformer stack above
+        -- `EarlyReturnT`.
+        return mkApp5 (mkConst ``EarlyReturnT.return [mi.u, mi.v]) ρ mi.m (← mkFreshResultType `δ) instMonad r }
+      let breakK := breakKVar.mkJump
       let continueK := continueKVar.mkJump
-      let withConts k := do
-        let e ← enterLoopBody γ returnK breakK continueK (k <| ← DoElemCont.mkPure α)
-        return e
+      let withConts k := enterLoopBody γ returnK breakK continueK (k pureK)
+      logInfo m!"before body: {γ}"
       let body ← withConts (elabElems1 (getDooElems trySeq))
+      logInfo m!"after body: {γ}"
+      logInfo m!"try body: {body}"
       let body ← xs.zip (eTypes?.zip catchSeqs) |>.foldlM (init := body) fun body (x, eType?, catchSeq) => do
         let x := Term.mkExplicitBinder x.raw[0] <| match eType? with
           | some eType => eType
@@ -1041,6 +1215,33 @@ mutual
           let inst ← Term.mkInstMVar <| mkApp2 (mkConst ``MonadExcept [uε, mi.u, mi.v]) ε mi.m
           return mkApp6 (mkConst ``MonadExcept.tryCatch [uε, mi.u, mi.v])
             ε mi.m inst γ body catch_
+      logInfo m!"before control stack stuff: {body}"
+      let reassignedMutVars ← do
+        let rootCtx := (← γ.mvarId!.getDecl).lctx
+        let pur ← pureKVar.getReassignedMutVars rootCtx
+        let brk ← breakKVar.getReassignedMutVars rootCtx
+        let cnt ← continueKVar.getReassignedMutVars rootCtx
+        pure <| mutVars.filter (pur.union brk |>.union cnt).contains
+      let breakT := (← breakKVar.jumpCount) > 0 || (← continueKVar.jumpCount) > 0
+      let stateT := reassignedMutVars.size > 0
+      let earlyReturnT ← returnMVar.mvarId!.isAssigned
+      let mut controlStack := ControlStack.base mi instMonad
+      if earlyReturnT then
+        controlStack := ControlStack.earlyReturnT ρ controlStack
+      if stateT then
+        let tys ← reassignedMutVars.mapM fun v => return (← getLocalDeclFromUserName v).type
+        let σ ← mkProdN tys
+        controlStack := ControlStack.stateT reassignedMutVars σ controlStack
+      if breakT then
+        let breakStack := ControlStack.breakT controlStack
+        breakStack.synthesizeBreak breakKVar
+        breakStack.synthesizeContinue continueKVar
+        controlStack := breakStack.toControlStack
+      discard <| isDefEq γ (controlStack.stM dec.resultType)
+      logInfo m!"γ: {γ}"
+
+      controlStack.synthesizePure pureK.resultName pureKVar
+
       let body ← match finSeq? with
         | none => pure body
         | some finSeq => do
@@ -1048,17 +1249,10 @@ mutual
           let fin ← enterFinally β <| elabElems1 (getDooElems finSeq) (← DoElemCont.mkPure β)
           let instMonadFinally ← Term.mkInstMVar <| mkApp (mkConst ``MonadFinally [mi.u, mi.v]) mi.m
           let instFunctor ← Term.mkInstMVar <| mkApp (mkConst ``Functor [mi.u, mi.v]) mi.m
-          return mkApp7 (mkConst ``tryFinally [mi.u, mi.v])
+          pure <| mkApp7 (mkConst ``tryFinally [mi.u, mi.v])
             mi.m γ β instMonadFinally instFunctor body fin
-      let reassignedMutVars ← pureKVar.getReassignedMutVars (← γ.mvarId!.getDecl).lctx
-      pureKVar.synthesizeJumps do
-        let r ← getFVarFromUserName rName
-        let (tuple, tupleTy) ← mkProdMkN (#[r] ++ (← reassignedMutVars.mapM (getFVarFromUserName ·)))
-        discard <| isDefEq γ tupleTy
-        mkPureApp γ tuple
-      mkBindCancellingPure (← mkFreshUserName `r) γ body fun p => do
-        bindMutVarsFromTuple (dec.resultName :: reassignedMutVars.toList) p.fvarId! do
-          dec.k
+
+      controlStack.restoreM body dec
     | _ => throwError "unexpected do element {dooElem}, {repr dooElem}"
 
   meta def elabElems1 (dooElems : Array (TSyntax `dooElem)) (k : DoElemCont) : DoElabM Expr := do
@@ -1254,7 +1448,7 @@ info: (let w := 23;
 
 set_option trace.Compiler.saveBase true in
 /--
-trace: [Compiler.saveBase] size: 68
+trace: [Compiler.saveBase] size: 73
     def List.foldrNonTR._at_.Do._example.spec_0 w _x.1 _x.2 x.3 _y.4 : Nat :=
       fun _f.5 s.6 : Nat :=
         let x := s.6 # 0;
@@ -1274,69 +1468,75 @@ trace: [Compiler.saveBase] size: 68
             cases a.15 : Nat
             | Prod.mk fst.16 snd.17 =>
               cases fst.16 : Nat
-              | Option.none =>
-                let _x.18 := _f.5 snd.17;
-                return _x.18
-              | Option.some val.19 =>
-                let _x.20 := acc snd.17;
-                return _x.20;
+              | Except.error a.18 =>
+                cases a.18 : Nat
+                | BreakContinue.break =>
+                  let _x.19 := _f.5 snd.17;
+                  return _x.19
+                | BreakContinue.continue =>
+                  let _x.20 := acc snd.17;
+                  return _x.20
+              | Except.ok a.21 =>
+                let _x.22 := acc snd.17;
+                return _x.22;
         let x := s # 0;
-        let s.21 := s # 1;
-        let y := s.21 # 0;
-        fun _f.22 z r.23 : Except Nat (Option PUnit × Nat × Nat × Nat) :=
-          let _x.24 := 10;
-          let _x.25 := Nat.decLt _x.24 x;
-          cases _x.25 : Except Nat (Option PUnit × Nat × Nat × Nat)
-          | Decidable.isFalse x.26 =>
-            let _x.27 := 20;
-            let _x.28 := Nat.decLt x _x.27;
-            cases _x.28 : Except Nat (Option PUnit × Nat × Nat × Nat)
-            | Decidable.isFalse x.29 =>
+        let s.23 := s # 1;
+        let y := s.23 # 0;
+        fun _f.24 z r.25 : Except Nat (Except BreakContinue PUnit × Nat × Nat × Nat) :=
+          let _x.26 := 10;
+          let _x.27 := Nat.decLt _x.26 x;
+          cases _x.27 : Except Nat (Except BreakContinue PUnit × Nat × Nat × Nat)
+          | Decidable.isFalse x.28 =>
+            let _x.29 := 20;
+            let _x.30 := Nat.decLt x _x.29;
+            cases _x.30 : Except Nat (Except BreakContinue PUnit × Nat × Nat × Nat)
+            | Decidable.isFalse x.31 =>
               let x := Nat.add x a;
-              let _x.30 := @Prod.mk _ _ y z;
-              let _x.31 := @Prod.mk _ _ x _x.30;
-              let _x.32 := PUnit.unit;
-              let _x.33 := @some _ _x.32;
-              let _x.34 := @Prod.mk _ _ _x.33 _x.31;
-              let _x.35 := @Except.ok _ _ _x.34;
-              return _x.35
-            | Decidable.isTrue x.36 =>
+              let _x.32 := @Prod.mk _ _ y z;
+              let _x.33 := @Prod.mk _ _ x _x.32;
+              let _x.34 := BreakContinue.continue;
+              let _x.35 := @Except.error _ _ _x.34;
+              let _x.36 := @Prod.mk _ _ _x.35 _x.33;
+              let _x.37 := @Except.ok _ _ _x.36;
+              return _x.37
+            | Decidable.isTrue x.38 =>
               let y := Nat.sub y _x.1;
-              let _x.37 := @Prod.mk _ _ y z;
-              let _x.38 := @Prod.mk _ _ x _x.37;
-              let _x.39 := @none _;
-              let _x.40 := @Prod.mk _ _ _x.39 _x.38;
-              let _x.41 := @Except.ok _ _ _x.40;
-              return _x.41
-          | Decidable.isTrue x.42 =>
+              let _x.39 := @Prod.mk _ _ y z;
+              let _x.40 := @Prod.mk _ _ x _x.39;
+              let _x.41 := BreakContinue.break;
+              let _x.42 := @Except.error _ _ _x.41;
+              let _x.43 := @Prod.mk _ _ _x.42 _x.40;
+              let _x.44 := @Except.ok _ _ _x.43;
+              return _x.44
+          | Decidable.isTrue x.45 =>
             let x := Nat.add x _x.2;
-            let _x.43 := @Prod.mk _ _ y z;
-            let _x.44 := @Prod.mk _ _ x _x.43;
-            let _x.45 := PUnit.unit;
-            let _x.46 := @some _ _x.45;
-            let _x.47 := @Prod.mk _ _ _x.46 _x.44;
-            let _x.48 := @Except.ok _ _ _x.47;
-            return _x.48;
-        let z := s.21 # 1;
-        let _x.49 := instDecidableEqNat x _x.2;
-        cases _x.49 : Nat
-        | Decidable.isFalse x.50 =>
-          let _x.51 := PUnit.unit;
-          let _x.52 := _f.22 z _x.51;
-          goto _jp.12 _x.52
-        | Decidable.isTrue x.53 =>
-          let z := Nat.add z a;
+            let _x.46 := @Prod.mk _ _ y z;
+            let _x.47 := @Prod.mk _ _ x _x.46;
+            let _x.48 := BreakContinue.continue;
+            let _x.49 := @Except.error _ _ _x.48;
+            let _x.50 := @Prod.mk _ _ _x.49 _x.47;
+            let _x.51 := @Except.ok _ _ _x.50;
+            return _x.51;
+        let z := s.23 # 1;
+        let _x.52 := instDecidableEqNat x _x.2;
+        cases _x.52 : Nat
+        | Decidable.isFalse x.53 =>
           let _x.54 := PUnit.unit;
-          let _x.55 := _f.22 z _x.54;
-          goto _jp.12 _x.55;
+          let _x.55 := _f.24 z _x.54;
+          goto _jp.12 _x.55
+        | Decidable.isTrue x.56 =>
+          let z := Nat.add z a;
+          let _x.57 := PUnit.unit;
+          let _x.58 := _f.24 z _x.57;
+          goto _jp.12 _x.58;
       cases x.3 : Nat
       | List.nil =>
-        let _x.56 := _f.5 _y.4;
-        return _x.56
-      | List.cons head.57 tail.58 =>
-        let _x.59 := @List.foldrNonTR _ _ _f.11 _f.5 tail.58;
-        let _x.60 := _f.11 head.57 _x.59 _y.4;
-        return _x.60
+        let _x.59 := _f.5 _y.4;
+        return _x.59
+      | List.cons head.60 tail.61 =>
+        let _x.62 := @List.foldrNonTR _ _ _f.11 _f.5 tail.61;
+        let _x.63 := _f.11 head.60 _x.62 _y.4;
+        return _x.63
 [Compiler.saveBase] size: 13
     def Do._example : Nat :=
       let w := 23;
@@ -1605,7 +1805,7 @@ trace: [Elab.do] let x := 42;
       let z := s.snd;
       pure (x + y + z)
 ---
-trace: [Compiler.saveBase] size: 38
+trace: [Compiler.saveBase] size: 42
     def List.foldrNonTR._at_.Do._example.spec_0 z x.1 _y.2 : Nat :=
       fun _f.3 s.4 : Nat :=
         let x := s.4 # 0;
@@ -1620,15 +1820,15 @@ trace: [Compiler.saveBase] size: 38
         let x := _y.2 # 0;
         let z := _y.2 # 1;
         let x := Nat.add x head.7;
-        fun _f.9 a acc s : Except Nat (Option PUnit × Nat × Nat) :=
+        fun _f.9 a acc s : Except Nat (Except BreakContinue PUnit × Nat × Nat) :=
           let _x.10 := Nat.add s x;
           let z := Nat.add _x.10 a;
           let _x.11 := acc z;
           return _x.11;
-        fun _f.12 s.13 : Except Nat (Option PUnit × Nat × Nat) :=
+        fun _f.12 s.13 : Except Nat (Except BreakContinue PUnit × Nat × Nat) :=
           let _x.14 := @Prod.mk _ _ x s.13;
-          let _x.15 := PUnit.unit;
-          let _x.16 := @some _ _x.15;
+          let _x.15 := BreakContinue.continue;
+          let _x.16 := @Except.error _ _ _x.15;
           let _x.17 := @Prod.mk _ _ _x.16 _x.14;
           let _x.18 := @Except.ok _ _ _x.17;
           return _x.18;
@@ -1649,12 +1849,17 @@ trace: [Compiler.saveBase] size: 38
           cases a.30 : Nat
           | Prod.mk fst.31 snd.32 =>
             cases fst.31 : Nat
-            | Option.none =>
-              let _x.33 := _f.3 snd.32;
-              return _x.33
-            | Option.some val.34 =>
-              let _x.35 := List.foldrNonTR._at_.Do._example.spec_0 z tail.8 snd.32;
-              return _x.35
+            | Except.error a.33 =>
+              cases a.33 : Nat
+              | BreakContinue.break =>
+                let _x.34 := _f.3 snd.32;
+                return _x.34
+              | BreakContinue.continue =>
+                let _x.35 := List.foldrNonTR._at_.Do._example.spec_0 z tail.8 snd.32;
+                return _x.35
+            | Except.ok a.36 =>
+              let _x.37 := List.foldrNonTR._at_.Do._example.spec_0 z tail.8 snd.32;
+              return _x.37
 [Compiler.saveBase] size: 10
     def Do._example : Nat :=
       let x := 42;
@@ -2072,7 +2277,7 @@ example :
   throw (α:=Nat) "error")
 = throw (α:=Nat) "error" := by rfl
 
-#check (Id.run <| ExceptT.run (ε:=String) do
+#check (Id.run <| ExceptT.run (ε:=String) doo
   let mut x := 0
   try
     if true then
@@ -2097,7 +2302,7 @@ example :
 
 -- Try/catch with reassignment
 example :
-  (Id.run (α:=Nat) <| ExceptT.run (ε:=String) doo
+  (Id.run <| ExceptT.run (ε:=String) doo
   let mut x := 0
   try
     if true then
@@ -2120,6 +2325,13 @@ example :
     x := x + 1
   return x) := by rfl
 
+#check (Id.run <| StateT.run' (σ := Nat) (s := 42) <| ExceptT.run (ε:=String) doo
+  try
+    pure ()
+  finally
+    set 0
+  get)
+
 -- Try/finally
 example {s} :
   (Id.run <| StateT.run' (σ := Nat) (s := s) <| ExceptT.run (ε:=String) doo
@@ -2133,7 +2345,7 @@ example {s} :
     e
   finally
     set 0
-  get) := by rfl
+  get) := by simp
 
 /-!
 Postponing Monad instance resolution appropriately
@@ -2141,13 +2353,13 @@ Postponing Monad instance resolution appropriately
 
 /--
 error: typeclass instance problem is stuck, it is often due to metavariables
-  Pure ?m.8
+  Pure ?m.9
 -/
 #guard_msgs (error) in
 example := doo return 42
 /--
 error: typeclass instance problem is stuck, it is often due to metavariables
-  Bind ?m.12
+  Bind ?m.14
 -/
 #guard_msgs (error) in
 example := doo let x <- ?z; ?y
