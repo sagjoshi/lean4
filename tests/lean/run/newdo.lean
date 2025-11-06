@@ -85,14 +85,55 @@ def Foldable.foldrTR [Foldable ρ α] (f : α → β → β) (init : β) (xs : �
 -- example := List.foldr (fun a b => a * b) 0 [1, 2, 3]
 
 @[inline]
+def Foldable.for_ {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type w → Type x} [Monad m] {γ} (xs : ρ) (body : α → m PUnit) (kbreak : m γ) : m γ :=
+  Foldable.foldr
+    (fun a kcontinue => do
+      let _ ← body a; kcontinue)
+    kbreak
+    xs
+
+@[inline]
+def Foldable.forS_ {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type w → Type x} [Monad m] {σ γ} (xs : ρ) (s : σ) (body : α → σ → m σ) (kbreak : σ → m γ) : m γ :=
+  Foldable.foldr
+    (fun a kcontinue s => do
+      let s ← body a s; kcontinue s)
+    kbreak
+    xs
+    s
+
+@[inline]
+def Foldable.forBreakS_ {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type w → Type x} [Monad m] {σ γ} (xs : ρ) (s : σ) (body : α → BreakT (StateT σ m) PUnit) (kbreak : σ → m γ) : m γ :=
+  Foldable.foldr
+    (fun a kcontinue s => do
+      let e ← body a s
+      match e with
+      | (.error .break, s) => kbreak s
+      | (_, s) => kcontinue s)
+    kbreak
+    xs
+    s
+
+@[inline]
+def Foldable.forReturnS_ {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type w → Type x} [Monad m] {σ ε γ} (xs : ρ) (s : σ) (body : α → StateT σ (EarlyReturnT ε m) PUnit) (kreturn : ε → m γ) (kbreak : σ → m γ) : m γ :=
+  Foldable.foldr
+    (fun a kcontinue s => do
+      let e ← body a s
+      match e with
+      | .error r => kreturn r
+      | .ok (_, s) => kcontinue s)
+    kbreak
+    xs
+    s
+
+@[inline]
 def Foldable.forBreak_ {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type w → Type x} [Monad m] {σ ε γ} (xs : ρ) (s : σ) (body : α → BreakT (StateT σ (EarlyReturnT ε m)) PUnit) (kreturn : ε → m γ) (kbreak : σ → m γ) : m γ :=
   Foldable.foldr
-    (fun a acc s => do
+    (fun a kcontinue s => do
       let e ← body a s
       match e with
       | .error r => kreturn r
       | .ok (.error .break, s) => kbreak s
-      | .ok (_, s) => acc s)
+      | .ok (_, s) => kcontinue s)
     kbreak
     xs
     s
@@ -315,7 +356,8 @@ abbrev DoElabM := ReaderT Context <| StateRefT State TermElabM
 /--
 Elaboration of a `do` block `do $e; $rest`, results in a call
 ``elabTerm `(do $e; $rest) = elabElem e dec``, where `elabElem e ·` is the elaborator for `do`
-`e`, and `dec` is the `DoElemCont` describing the elaboration of the rest of the block `rest`.
+element `e`, and `dec` is the `DoElemCont` describing the elaboration of the rest of the block
+`rest`.
 
 If the semantics of `e` resumes its continuation `rest`, its elaborator must bind its result to
 `resultName`, ensure that it has type `resultType` and then elaborate `rest` using `dec`.
@@ -341,6 +383,15 @@ structure DoElemCont where
   /-- The continuation to elaborate the `rest` of the block. -/
   k : DoElabM Expr
 deriving Inhabited
+
+/--
+The type of elaborators for `do` block elements.
+
+It is ``elabTerm `(do $e; $rest) = elabElem e dec``, where `elabElem e ·` is the elaborator for `do`
+element `e`, and `dec` is the `DoElemCont` describing the elaboration of the rest of the block
+`rest`.
+-/
+abbrev DoElemElab := DoElemCont → DoElabM Expr
 
 /--
 Information about a success, `return`, `break` or `continue` continuation that will be filled in
@@ -793,14 +844,14 @@ structure ControlStack where
   instMonad : Expr
   stM : Expr → Expr
   runInBase : Expr → DoElabM Expr
-  restoreM : Expr → DoElemCont → DoElabM Expr
+  restoreCont : DoElemCont → MetaM DoElemCont
 
 def ControlStack.base (mi : MonadInfo) (instMonad : Expr) : ControlStack where
   monadInfo := mi
   instMonad := instMonad
   stM α := α
   runInBase e := pure e
-  restoreM e dec := dec.mkBindUnlessPure e
+  restoreCont dec := pure dec
 
 def ControlStack.stateT (reassignedMutVars : Array Name) (σ : Expr) (m : ControlStack) : ControlStack where
   monadInfo :=
@@ -814,8 +865,8 @@ def ControlStack.stateT (reassignedMutVars : Array Name) (σ : Expr) (m : Contro
     let (tuple, _tupleTy) ← mkProdMkN (← reassignedMutVars.mapM (getFVarFromUserName ·))
     let tuple ← Term.ensureHasType σ tuple
     return mkApp e tuple
-  restoreM e dec := do
-    -- `e : m (α × σ)`. Restore in the base monad `m` with a continuation that unpacks the tuple
+  restoreCont dec := do
+    -- Wrap `dec` such that the result type is `(dec.resultType × σ)` by unpacking the state tuple
     -- before calling `dec.k`. See also `StateT.monadControl.restoreM`.
     let resultName ← mkFreshUserName `p
     let resultType := stM dec.resultType
@@ -823,7 +874,7 @@ def ControlStack.stateT (reassignedMutVars : Array Name) (σ : Expr) (m : Contro
       let p ← getFVarFromUserName resultName
       bindMutVarsFromTuple (dec.resultName :: reassignedMutVars.toList) p.fvarId! do
         dec.k
-    m.restoreM e { resultName, resultType, k }
+    m.restoreCont { resultName, resultType, k }
 where
   mi := m.monadInfo
   stM α := mkApp2 (mkConst ``Prod [mi.u, mi.u]) α σ
@@ -838,27 +889,21 @@ def ControlStack.earlyReturnT (ρ : Expr) (m : ControlStack) : ControlStack wher
     -- `e : EarlyReturnT ρ m α`. Return `e`, which is defeq to `ExceptT.run e`.
     -- See also `instMonadControlExceptTOfMonad.liftWith`.
     return e
-  restoreM e dec := do
-    -- `e : m (Except ρ α)`. Restore in the base monad `m` with a continuation that unpacks the
-    -- Except before calling `dec.k`. See also `instMonadControlExceptTOfMonad.restoreM`.
+  restoreCont dec := do
+    -- Wrap `dec` such that the result type is `Except ρ dec.resultType` by unpacking the exception,
+    -- calling `dec.k` in the success case. See also `instMonadControlExceptTOfMonad.restoreM`.
     let resultName ← mkFreshUserName `e
-    logInfo m!"e: {e}"
-    logInfo m!"dec.resultType: {dec.resultType}"
     let resultType := stM dec.resultType
-    logInfo m!"resultType: {resultType}"
     let k := do
       let e ← getFVarFromUserName resultName
       let outerReturnCont ← getReturnCont
-      logInfo m!"outerReturnCont: {outerReturnCont.resultName}, {outerReturnCont.resultType}"
       let kreturn ← withLocalDeclD outerReturnCont.resultName outerReturnCont.resultType fun r => do
         mkLambdaFVars #[r] (← outerReturnCont.k)
-      logInfo m!"kreturn: {kreturn}"
       let ksuccess ← withLocalDeclD dec.resultName dec.resultType fun r => do
         mkLambdaFVars #[r] (← dec.k)
-      logInfo m!"kreturn: {kreturn}, ksuccess: {ksuccess}"
       let β ← mkMonadicType (← read).doBlockResultType
       return mkApp6 (mkConst ``EarlyReturn.runK [mi.u, mi.v]) ρ dec.resultType β e kreturn ksuccess
-    m.restoreM e { resultName, resultType, k }
+    m.restoreCont { resultName, resultType, k }
 where
   mi := m.monadInfo
   stM α := mkApp2 (mkConst ``Except [mi.u, mi.u]) ρ α
@@ -877,9 +922,10 @@ def ControlStack.breakT (m : ControlStack) : BreakControlStack where
     -- `e : BreakT m α`. Return `e`, which is defeq to `ExceptT.run e`.
     -- See also `instMonadControlExceptTOfMonad.liftWith`.
     return e
-  restoreM e dec := do
-    -- `e : m (Except BreakContinue α)`. Restore in the base monad `m` with a continuation that
-    -- unpacks the Except before calling `dec.k`. See also `instMonadControlExceptTOfMonad.restoreM`.
+  restoreCont dec := do
+    -- Wrap `dec` such that the result type is `Except BreakContinue dec.resultType` by unpacking
+    -- the exception, calling `dec.k` in the success case.
+    -- See also `instMonadControlExceptTOfMonad.restoreM`.
     let resultName ← mkFreshUserName `e
     let resultType := stM dec.resultType
     let k := do
@@ -896,7 +942,7 @@ def ControlStack.breakT (m : ControlStack) : BreakControlStack where
         mkLambdaFVars #[r] (← dec.k)
       let β ← mkMonadicType (← read).doBlockResultType
       return mkApp6 (mkConst ``Break.runK [mi.u, mi.v]) dec.resultType β e kbreak kcontinue ksuccess
-    m.restoreM e { resultName, resultType, k }
+    m.restoreCont { resultName, resultType, k }
   synthesizeBreak kvar := do
     kvar.synthesizeJumps do
       m.runInBase <| mkApp2 (mkConst ``BreakT.break [mi.u, mi.v]) mi.m m.instMonad
@@ -954,7 +1000,7 @@ meta def ControlLifter.ofCont (dec : DoElemCont) : DoElabM ControlLifter := do
   let hasEarlyReturn := returnMVar.mvarId!.isAssigned
   return { mutVars, monadInfo := mi, instMonad, successCont := dec, pureKVar, breakKVar, continueKVar, returnCont, hasEarlyReturn, resultType := γ }
 
-meta def ControlLifter.lift (l : ControlLifter) (k : DoElemCont → DoElabM α) : DoElabM α := do
+meta def ControlLifter.lift (l : ControlLifter) (elabElem : DoElemElab) : DoElabM Expr := do
   let oldBreakCont ← getBreakCont
   let oldContinueCont ← getContinueCont
   let breakCont := Functor.mapConst l.breakKVar.mkJump oldBreakCont
@@ -962,18 +1008,18 @@ meta def ControlLifter.lift (l : ControlLifter) (k : DoElemCont → DoElabM α) 
   let returnCont := l.returnCont
   let contInfo := ContInfo.toContInfoRef { breakCont, continueCont, returnCont }
   let pureCont := { l.successCont with k := l.pureKVar.mkJump }
-  withReader (fun ctx => { ctx with contInfo, doBlockResultType := l.resultType }) <| k pureCont
+  withReader (fun ctx => { ctx with contInfo, doBlockResultType := l.resultType }) <| elabElem pureCont
 
-meta def ControlLifter.continueWith (l : ControlLifter) (body : Expr) : DoElabM Expr := do
+meta def ControlLifter.synthesizeConts (l : ControlLifter) (breakT? : Option Bool := none) (stateT? : Option Bool := none) (earlyReturnT? : Option Bool := none) : DoElabM (ControlStack × Array Name) := do
   let reassignedMutVars ← do
     let rootCtx := (← l.resultType.mvarId!.getDecl).lctx
     let pur ← l.pureKVar.getReassignedMutVars rootCtx
     let brk ← l.breakKVar.getReassignedMutVars rootCtx
     let cnt ← l.continueKVar.getReassignedMutVars rootCtx
     pure <| l.mutVars.filter (pur.union brk |>.union cnt).contains
-  let breakT := (← l.breakKVar.jumpCount) > 0 || (← l.continueKVar.jumpCount) > 0
-  let stateT := reassignedMutVars.size > 0
-  let earlyReturnT ← l.hasEarlyReturn
+  let breakT := breakT? = some true || (← l.breakKVar.jumpCount) > 0 || (← l.continueKVar.jumpCount) > 0
+  let stateT := stateT? = some true || (reassignedMutVars.size > 0)
+  let earlyReturnT := earlyReturnT? = some true || (← l.hasEarlyReturn)
   let mut controlStack := ControlStack.base l.monadInfo l.instMonad
   if earlyReturnT then
     controlStack := ControlStack.earlyReturnT l.returnCont.resultType controlStack
@@ -987,10 +1033,12 @@ meta def ControlLifter.continueWith (l : ControlLifter) (body : Expr) : DoElabM 
     breakStack.synthesizeContinue l.continueKVar
     controlStack := breakStack.toControlStack
   discard <| isDefEq l.resultType (controlStack.stM l.successCont.resultType)
-
   controlStack.synthesizePure l.successCont.resultName l.pureKVar
+  return (controlStack, reassignedMutVars)
 
-  controlStack.restoreM body l.successCont
+meta def ControlLifter.restoreCont (l : ControlLifter) : DoElabM DoElemCont := do
+  let (controlStack, _reassignedMutVars) ← l.synthesizeConts
+  controlStack.restoreCont l.successCont
 
 /--
 Introduce proxy redefinitions for *all* mut vars and call the continuation `k` with a function
@@ -1016,6 +1064,29 @@ meta def withProxyMutVarDefs [Inhabited α] (k : (Expr → MetaM Expr) → DoEla
       let e ← elimMVarDeps proxyDefs e
       return e.replaceFVars proxyDefs actualDefs
     k elimProxyDefs
+
+meta def ControlLifter.liftLoopBody (l : ControlLifter) (elabBody : DoElemElab) : DoElabM (Expr × Expr) := do
+  let σ ← mkFreshResultType `σ
+  withLocalDeclD (← mkFreshUserName `s) σ fun loopS => do
+  withProxyMutVarDefs fun elimProxyDefs => do
+    let body ← do
+      let breakCont := l.breakKVar.mkJump
+      let continueCont := l.continueKVar.mkJump
+      let returnCont := l.returnCont
+      let contInfo := ContInfo.toContInfoRef { breakCont, continueCont, returnCont }
+      withReader (fun ctx => { ctx with contInfo, doBlockResultType := l.resultType }) <|
+        elabBody { l.successCont with k := l.continueKVar.mkJump }
+    let (_controlStack, reassignedMutVars) ← l.synthesizeConts (breakT? := true) (stateT? := true) (earlyReturnT? := true)
+    let body ← bindMutVarsFromTuple reassignedMutVars.toList loopS.fvarId! do
+      -- Replace the proxy variables with their actual definitions, as if we never introduced
+      -- them in the first place.
+      elimProxyDefs body
+    let preS ← σ.mvarId!.withContext do
+      let defs ← reassignedMutVars.mapM (getFVarFromUserName ·)
+      let (tuple, tupleTy) ← mkProdMkN defs
+      discard <| isDefEq σ tupleTy
+      pure tuple
+    return (← mkLambdaFVars #[loopS] body, preS)
 
 mutual
   meta def elabElem (dooElem : TSyntax `dooElem) (dec : DoElemCont) : DoElabM Expr := withRef dooElem do
@@ -1092,8 +1163,13 @@ mutual
       let returnCont ← getReturnCont
       let ε := returnCont.resultType
       let γ := (← read).doBlockResultType
-      let (body, preS, reassignedMutVars) ←
+      let l ← ControlLifter.ofCont dec
+      let (body, preS) ←
         withLocalDeclD x.getId α fun x => do
+          let (body, preS) ← l.liftLoopBody <| elabElems1 (getDooElems dooSeq)
+          let body ← mkLambdaFVars #[x] body
+          return (body, preS)
+      /-
         withLocalDeclD (← mkFreshUserName `s) σ fun loopS => do
           -- result type is
           -- Except ε (Except BreakContinue × σ)
@@ -1160,13 +1236,11 @@ mutual
           let body ← mkLambdaFVars #[x, loopS] block
 
           return (body, preS, reassignedMutVars)
-
+      -/
       let kreturn ← withLocalDeclD returnCont.resultName ε fun r => do
         mkLambdaFVars #[r] (← returnCont.k)
       let kafter ← withLocalDeclD (← mkFreshUserName `s) σ fun postS => do mkLambdaFVars #[postS] <| ← do
-        bindMutVarsFromTuple reassignedMutVars.toList postS.fvarId! do
-          let k ← dec.continueWithUnit
-          Term.ensureHasType (← mkMonadicType γ) k
+        (← l.restoreCont).continueWithUnit
       let instFoldable ← Term.mkInstMVar <| mkApp2 (mkConst ``Foldable [uρ, uα, mi.u]) ρ α
       let app := mkConst ``Foldable.forBreak_ [uρ, uα, mi.u, mi.v]
       let app := mkApp5 app ρ α instFoldable mi.m instMonad
@@ -1240,7 +1314,7 @@ mutual
           let instFunctor ← Term.mkInstMVar <| mkApp (mkConst ``Functor [mi.u, mi.v]) mi.m
           pure <| mkApp7 (mkConst ``tryFinally [mi.u, mi.v])
             mi.m lifter.resultType β instMonadFinally instFunctor body fin
-      lifter.continueWith body
+      (← lifter.restoreCont).mkBindUnlessPure body
     | _ => throwError "unexpected do element {dooElem}, {repr dooElem}"
 
   meta def elabElems1 (dooElems : Array (TSyntax `dooElem)) (k : DoElemCont) : DoElabM Expr := do
@@ -1306,6 +1380,13 @@ set_option trace.Compiler.saveBase true in
 example (x : Option PEmpty) : Nat :=
   match x with
   | none => 0
+
+set_option trace.Elab.do true in
+#check Id.run doo
+  let mut x := 42
+  for i in [1,2,3] doo
+    x := x + i
+  return x
 
 set_option trace.Elab.do true in
 #check Id.run doo
