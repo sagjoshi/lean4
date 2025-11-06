@@ -1168,12 +1168,18 @@ mutual
       let γ := (← read).doBlockResultType
       dec.withDuplicableCont fun dec => do
       let β ← mkArrow σ (← mkMonadicType γ)
+      let mutVars := (← read).mutVars
+      let mutVarsSet := .ofArray mutVars
       let (kcons, preS, reassignedMutVars) ←
         withLocalDeclD x.getId α fun x => do
         withLocalDeclD (← mkFreshUserName `kcontinue) β fun kcontinue => do
         withLocalDeclD (← mkFreshUserName `s) σ fun loopS => do
-        withProxyMutVarDefs fun elimProxyDefs => do
-          let mutVars := (← read).mutVars
+        -- Make mut vars opaque, as if they were `have`-bound
+        let mut ctx ← getLCtx
+        let preDecls := ctx.findFromUserNames mutVarsSet
+        for decl in preDecls do
+          ctx := ctx.modifyLocalDecl decl.fvarId (·.setNondep true)
+        withLCtx' ctx do
           let breakKVar    ← mkFreshContVar γ mutVars
           let continueKVar ← mkFreshContVar γ mutVars
           let s ← mkFreshUserName `s
@@ -1203,13 +1209,19 @@ mutual
           breakKVar.synthesizeJumps do
             dec.continueWithUnit
 
+          let outerCtx ← getLCtx
           let body ← bindMutVarsFromTuple reassignedMutVars.toList loopS.fvarId! do
             -- Replace the proxy variables with their actual definitions, as if we never introduced
             -- them in the first place.
-            elimProxyDefs body
+            let newCtx ← getLCtx
+            let loopDecls := newCtx.findFromUserNames mutVarsSet (start := outerCtx.numIndices)
+            let loopDefs := loopDecls.map (·.toExpr)
+            let preDecls := loopDecls.map fun decl => preDecls.find? (decl.userName = ·.userName) |>.get!
+            let preDefs := preDecls.map (·.toExpr)
+            let body ← elimMVarDeps preDefs body
+            pure <| body.replaceFVars preDefs loopDefs
 
           return (← mkLambdaFVars #[x, kcontinue, loopS] body, preS, reassignedMutVars)
-      logInfo m!"reassignedMutVars: {reassignedMutVars}"
       let knil ← withLocalDeclD (← mkFreshUserName `s) σ fun postS => do mkLambdaFVars #[postS] <| ← do
         bindMutVarsFromTuple reassignedMutVars.toList postS.fvarId! do
           dec.continueWithUnit
