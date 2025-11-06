@@ -7,32 +7,15 @@ import Init.Control.StateCps
 
 open Lean Parser Meta Elab
 
-#reduce (types := true) StateT Bool (ExceptCpsT Nat Id) Nat
-#reduce (types := true) OptionCpsT (StateT Bool Id) Nat
-#reduce (types := true) OptionCpsT (StateCpsT Bool Id) Nat
-#reduce (types := true) Nat → OptionCpsT Id PUnit
-
-def OptionT.runK [Monad m] (x : OptionT m α) (ok : α → m β) (error : Unit → m β) : m β :=
-  x.run >>= (·.casesOn (error ()) ok)
-
 def ExceptT.runK [Monad m] (x : ExceptT ε m α) (ok : α → m β) (error : ε → m β) : m β :=
   x.run >>= (·.casesOn error ok)
 
 def ExceptT.runCatch [Monad m] (x : ExceptT α m α) : m α :=
   x.runK pure pure
 
-abbrev EarlyReturn.{u} := Except.{u, u}
-abbrev EarlyReturn.return {m : Type w → Type x} [Monad m] (r : ρ) : m (EarlyReturn ρ α) :=
-  pure (Except.error r)
-abbrev EarlyReturn.pure {m : Type w → Type x} [Monad m] (a : α) : m (EarlyReturn ρ α) :=
-  Pure.pure (Except.ok a)
-
 abbrev EarlyReturnT (ρ m α) := ExceptT ρ m α
 abbrev EarlyReturnT.return {ρ m α} [Monad m] (r : ρ) : EarlyReturnT ρ m α :=
   throw r
-abbrev EarlyReturnT.runK {ρ m α β} [Monad m] (x : EarlyReturnT ρ m α) (kreturn : ρ → m β) (kpure : α → m β) : m β :=
-  ExceptT.runK x kpure kreturn
-
 abbrev EarlyReturn.runK {ρ α : Type u} {β : Type v} (x : Except ρ α) (ret : ρ → β) (pure : α → β) : β :=
   x.casesOn ret pure
 
@@ -40,29 +23,11 @@ inductive BreakContinue : Type u where
   | break
   | continue
 
-abbrev Break.{u} := Except.{u, u} BreakContinue
-abbrev Break.break {m : Type w → Type x} [Monad m] : m (Break α) :=
-  pure (Except.error .break)
-abbrev Break.continue {m : Type w → Type x} [Monad m] : m (Break α) :=
-  pure (Except.error .continue)
-abbrev Break.pure {m : Type w → Type x} [Monad m] (a : α) : m (Break α) :=
-  Pure.pure (Except.ok a)
-
 abbrev BreakT := ExceptT BreakContinue
 abbrev BreakT.break {m : Type w → Type x} [Monad m] : BreakT m PUnit := throw .break
 abbrev BreakT.continue {m : Type w → Type x} [Monad m] : BreakT m PUnit := throw .continue
-
 abbrev Break.runK {α : Type u} {β : Type v} (x : Except BreakContinue.{u} α) (breakK : Unit → β) (continueK : Unit → β) (successK : α → β) : β :=
   x.casesOn (·.casesOn (breakK ()) (continueK ())) successK
-
-inductive LetMuts
-
-/-- info: fun α => Except EarlyReturn (Except BreakContinue α × LetMuts) -/
-#guard_msgs in
-#reduce (types := true) stM Id (ExceptT BreakContinue (StateT LetMuts (ExceptT EarlyReturn Id)))
-
-#reduce liftWith (m:=Id) (n:=ExceptT BreakContinue (StateT LetMuts (ExceptT EarlyReturn Id)))
-#reduce restoreM (m:=Id) (n:=ExceptT BreakContinue (StateT LetMuts (ExceptT EarlyReturn Id)))
 
 class Foldable (ρ : Type u) (α : outParam (Type v)) extends Membership α ρ where
   foldr {β : Type w} : (α → β → β) → β → ρ → β
@@ -805,15 +770,23 @@ meta def enterLoopBody (resultType : Expr) (returnCont : DoElemCont) (breakCont 
   withReader fun ctx => { ctx with contInfo, doBlockResultType := resultType }
 
 /--
+Prepare the context for elaborating the body of a `do` block that does not support `mut` vars,
+`break`, `continue` or `return`.
+-/
+meta def withoutControl (k : DoElabM Expr) : DoElabM Expr := do
+  let error := throwError "This `do` block does not support `break`, `continue` or `return`."
+  let dec ← getReturnCont
+  let contInfo := { breakCont := error, continueCont := error, returnCont := { dec with k := error }}
+  let contInfo := ContInfo.toContInfoRef contInfo
+  withReader (fun ctx => { ctx with contInfo }) k
+
+/--
 Prepare the context for elaborating the body of a `finally` block.
 There is no support for `mut` vars, `break`, `continue` or `return` in a `finally` block.
 -/
 meta def enterFinally (resultType : Expr) (k : DoElabM Expr) : DoElabM Expr := do
-  let error := throwError "`finally` does not support `break`, `continue` or `return`."
-  let dec ← getReturnCont
-  let contInfo := { breakCont := error, continueCont := error, returnCont := { dec with k := error }}
-  let contInfo := ContInfo.toContInfoRef contInfo
-  withReader (fun ctx => { ctx with contInfo, doBlockResultType := resultType }) k
+  withoutControl do
+  withReader (fun ctx => { ctx with doBlockResultType := resultType }) k
 
 structure ControlStack where
   monadInfo : MonadInfo
@@ -957,7 +930,7 @@ structure ControlLifter where
   hasEarlyReturn : MetaM Bool
   resultType : Expr
 
-meta def ControlLifter.mk' (dec : DoElemCont) : DoElabM ControlLifter := do
+meta def ControlLifter.ofCont (dec : DoElemCont) : DoElabM ControlLifter := do
   let mi := (← read).monadInfo
   let oldReturnCont ← getReturnCont
   -- γ is the result type of the `try` block. It is `stM m (t m)` for whatever `t` is necessary
@@ -981,7 +954,7 @@ meta def ControlLifter.mk' (dec : DoElemCont) : DoElabM ControlLifter := do
   let hasEarlyReturn := returnMVar.mvarId!.isAssigned
   return { mutVars, monadInfo := mi, instMonad, successCont := dec, pureKVar, breakKVar, continueKVar, returnCont, hasEarlyReturn, resultType := γ }
 
-meta def ControlLifter.withConts (l : ControlLifter) (k : DoElemCont → DoElabM α) : DoElabM α := do
+meta def ControlLifter.lift (l : ControlLifter) (k : DoElemCont → DoElabM α) : DoElabM α := do
   let oldBreakCont ← getBreakCont
   let oldContinueCont ← getContinueCont
   let breakCont := Functor.mapConst l.breakKVar.mkJump oldBreakCont
@@ -991,7 +964,7 @@ meta def ControlLifter.withConts (l : ControlLifter) (k : DoElemCont → DoElabM
   let pureCont := { l.successCont with k := l.pureKVar.mkJump }
   withReader (fun ctx => { ctx with contInfo, doBlockResultType := l.resultType }) <| k pureCont
 
-meta def ControlLifter.restore (l : ControlLifter) (body : Expr) : DoElabM Expr := do
+meta def ControlLifter.continueWith (l : ControlLifter) (body : Expr) : DoElabM Expr := do
   let reassignedMutVars ← do
     let rootCtx := (← l.resultType.mvarId!.getDecl).lctx
     let pur ← l.pureKVar.getReassignedMutVars rootCtx
@@ -1238,22 +1211,16 @@ mutual
       -- So we need to pack up our effects and unpack them after the `try`.
       -- We could optimize for the `.last` case by omitting the state tuple ... in the future.
       let mi := (← read).monadInfo
-      let lifter ← ControlLifter.mk' dec
-      let body ← lifter.withConts (elabElems1 (getDooElems trySeq))
+      let lifter ← ControlLifter.ofCont dec
+      let body ← lifter.lift (elabElems1 (getDooElems trySeq))
       let body ← xs.zip (eTypes?.zip catchSeqs) |>.foldlM (init := body) fun body (x, eType?, catchSeq) => do
         let x := Term.mkExplicitBinder x.raw[0] <| match eType? with
           | some eType => eType
           | none => mkHole x
         let (catch_, ε, uε) ← elabBinder x fun x => do
-          let ε ←
-            if let some eType := eType? then
-              let eType ← Term.elabType eType
-              discard <| Term.ensureHasType eType x
-              pure eType
-            else
-              inferType x
+          let ε ← inferType x
           let uε ← getDecLevel ε
-          let catch_ ← lifter.withConts (elabElems1 (getDooElems catchSeq))
+          let catch_ ← lifter.lift (elabElems1 (getDooElems catchSeq))
           let catch_ ← mkLambdaFVars #[x] catch_
           return (catch_, ε, uε)
         if eType?.isSome then
@@ -1273,8 +1240,7 @@ mutual
           let instFunctor ← Term.mkInstMVar <| mkApp (mkConst ``Functor [mi.u, mi.v]) mi.m
           pure <| mkApp7 (mkConst ``tryFinally [mi.u, mi.v])
             mi.m lifter.resultType β instMonadFinally instFunctor body fin
-
-      lifter.restore body
+      lifter.continueWith body
     | _ => throwError "unexpected do element {dooElem}, {repr dooElem}"
 
   meta def elabElems1 (dooElems : Array (TSyntax `dooElem)) (k : DoElemCont) : DoElabM Expr := do
