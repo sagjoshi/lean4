@@ -84,66 +84,12 @@ def Foldable.foldrTR [Foldable ρ α] (f : α → β → β) (init : β) (xs : �
 -- set_option trace.Compiler.saveBase true in
 -- example := List.foldr (fun a b => a * b) 0 [1, 2, 3]
 
-@[inline]
-def Foldable.for_ {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type w → Type x} [Monad m] {γ} (xs : ρ) (body : α → m PUnit) (kbreak : m γ) : m γ :=
-  Foldable.foldr
-    (fun a kcontinue => do
-      let _ ← body a; kcontinue)
-    kbreak
-    xs
-
-@[inline]
-def Foldable.forS_ {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type w → Type x} [Monad m] {σ γ} (xs : ρ) (s : σ) (body : α → σ → m σ) (kbreak : σ → m γ) : m γ :=
-  Foldable.foldr
-    (fun a kcontinue s => do
-      let s ← body a s; kcontinue s)
-    kbreak
-    xs
-    s
-
-@[inline]
-def Foldable.forBreakS_ {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type w → Type x} [Monad m] {σ γ} (xs : ρ) (s : σ) (body : α → BreakT (StateT σ m) PUnit) (kbreak : σ → m γ) : m γ :=
-  Foldable.foldr
-    (fun a kcontinue s => do
-      let e ← body a s
-      match e with
-      | (.error .break, s) => kbreak s
-      | (_, s) => kcontinue s)
-    kbreak
-    xs
-    s
-
-@[inline]
-def Foldable.forReturnS_ {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type w → Type x} [Monad m] {σ ε γ} (xs : ρ) (s : σ) (body : α → StateT σ (EarlyReturnT ε m) PUnit) (kreturn : ε → m γ) (kbreak : σ → m γ) : m γ :=
-  Foldable.foldr
-    (fun a kcontinue s => do
-      let e ← body a s
-      match e with
-      | .error r => kreturn r
-      | .ok (_, s) => kcontinue s)
-    kbreak
-    xs
-    s
-
-@[inline]
-def Foldable.forBreak_ {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type w → Type x} [Monad m] {σ ε γ} (xs : ρ) (s : σ) (body : α → BreakT (StateT σ (EarlyReturnT ε m)) PUnit) (kreturn : ε → m γ) (kbreak : σ → m γ) : m γ :=
-  Foldable.foldr
-    (fun a kcontinue s => do
-      let e ← body a s
-      match e with
-      | .error r => kreturn r
-      | .ok (.error .break, s) => kbreak s
-      | .ok (_, s) => kcontinue s)
-    kbreak
-    xs
-    s
-
 set_option pp.all true in
 @[inline]
-def Foldable.forBreak_Inv {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type (max v w) → Type x} [Monad m] {σ ε γ}
-    (xs : ρ) (s : σ) (body : α → BreakT (StateT σ (EarlyReturnT ε m)) PUnit) (kreturn : ε → m γ) (kbreak : σ → m γ)
+def Foldable.foldrInv {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type (max v w) → Type x} [Monad m] {σ γ}
+    (kcons : α → (σ → m γ) → σ → m γ) (knil : σ → m γ) (xs : ρ) (s : σ)
     [inst : Foldable ρ α] {ps} [Std.Do.WP m ps] (inv : Std.Do.Invariant (inst.toList xs) σ ps) : m γ :=
-  forBreak_ xs s body kreturn kbreak
+  Foldable.foldr kcons knil xs s
 
 declare_syntax_cat dooElem
 
@@ -1311,27 +1257,37 @@ mutual
     | `(dooElem| for $x:ident in $xs invariant $cursorBinder $stateBinders* => $body doo $dooSeq) =>
       --trace[Elab.do] "cursorBinder: {cursorBinder}"
       let call ← elabElem (← `(dooElem| for $x:ident in $xs doo $dooSeq)) dec
-      let_expr Foldable.forBreak_ ρ α _ _ _ σ _ _ xs s _ _ _ := call
-        | throwError "Internal elaboration error: `for` loop did not elaborate to a call of `Foldable.forBreak_`."
+      let_expr Foldable.foldr ρ α instFoldable σmγ kcons knil xs s := call
+        | throwError "Internal elaboration error: `for` loop did not elaborate to a call of `Foldable.foldr`."
+      let σ ← mkFreshResultType `σ
+      let γ ← mkFreshResultType `γ
+      unless ← isDefEqGuarded σmγ (← mkArrow σ (← mkMonadicType γ)) do
+        throwError "The continuation type {σmγ} did not unify with {← mkArrow σ (← mkMonadicType γ)} in {indentExpr call}"
       call.withApp fun head args => do
-      let [u, v, w, x] := head.constLevels!
-        | throwError "`Foldable.forBreak_` had wrong number of levels {head.constLevels!}"
-      unless ← isLevelDefEq v w do
-        throwError "The universe level of the monadic result type {w} and that of the state tuple {v} were different. Cannot elaborate invariants for this case."
-      let head := mkConst ``Foldable.forBreak_Inv [u, v, w, x]
+      let [u, v, w] := head.constLevels!
+        | throwError "`Foldable.foldr` had wrong number of levels {head.constLevels!}"
+      let mi := (← read).monadInfo
+      unless ← isLevelDefEq mi.u w do
+        throwError "The universe level of the monadic result type {mi.u} and that of the state tuple {w} were different. Cannot elaborate invariants for this case."
+      -- First the non-ghost arguments
+      let instMonad ← Term.mkInstMVar (mkApp (mkConst ``Monad [mi.u, mi.v]) mi.m)
+      let app := mkConst ``Foldable.foldrInv [u, v, mi.u, mi.v]
+      let app := mkApp7 app ρ α instFoldable mi.m instMonad σ γ
+      let app := mkApp4 app kcons knil xs s
+      -- Now the ghost arguments
       let instFoldable ← Term.mkInstMVar (mkApp2 (mkConst ``Foldable [u, v, v]) ρ α)
-      let ps ← mkFreshExprMVar (mkConst ``Std.Do.PostShape [w])
-      let instWP ← Term.mkInstMVar (mkApp2 (mkConst ``Std.Do.WP [w, x]) (← read).monadInfo.m ps)
+      let ps ← mkFreshExprMVar (mkConst ``Std.Do.PostShape [mi.u])
+      let instWP ← Term.mkInstMVar (mkApp2 (mkConst ``Std.Do.WP [mi.u, mi.v]) (← read).monadInfo.m ps)
       let xsToList := mkApp4 (mkConst ``Foldable.toList [u, v]) ρ α instFoldable xs
-      let inv ← mkFreshExprMVar (mkApp4 (mkConst ``Std.Do.Invariant [v, v]) α xsToList σ ps)
+      let inv ← mkFreshExprMVar (mkApp4 (mkConst ``Std.Do.Invariant [v, mi.u]) α xsToList σ ps)
       let cursor := mkApp2 (mkConst ``List.Cursor [v]) α xsToList
-      let assertion := mkApp (mkConst ``Std.Do.Assertion [w]) ps
+      let assertion := mkApp (mkConst ``Std.Do.Assertion [mi.u]) ps
       let mutVarsTuple ← Term.exprToSyntax s
-      let cursorσ := mkApp2 (mkConst ``Prod [v, v]) cursor σ
+      let cursorσ := mkApp2 (mkConst ``Prod [v, mi.u]) cursor σ
       let syn ← `(fun ($cursorBinder, $mutVarsTuple) $stateBinders* => $body)
       let success ← Term.elabFun (← `(fun ($cursorBinder, $mutVarsTuple) $stateBinders* => $body)) (← mkArrow cursorσ assertion)
-      let inv := mkApp3 (mkConst ``Std.Do.PostCond.noThrow [w]) ps cursorσ success
-      return mkApp4 (mkAppN head args) instFoldable ps instWP inv
+      let inv := mkApp3 (mkConst ``Std.Do.PostCond.noThrow [mkLevelMax v mi.u]) ps cursorσ success
+      return mkApp4 app instFoldable ps instWP inv
 -- Why doesn't the following work?
 --    | `(dooElem| try $trySeq:dooSeq $[$catchSeqs:dooCatch]* $[finally $finSeq?]?) =>
     | `(dooElem| try $trySeq:dooSeq $[catch $xs $[: $eTypes?]? => $catchSeqs]* $[finally $finSeq?]?) =>
