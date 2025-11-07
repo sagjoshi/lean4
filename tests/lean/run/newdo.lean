@@ -34,17 +34,22 @@ class Foldable (ρ : Type u) (α : outParam (Type v)) extends Membership α ρ w
   foldrMem {β : Type w} : (xs : ρ) → ((a : α) → a ∈ xs → β → β) → β → β
   foldl {β : Type w} : (β → α → β) → β → ρ → β
   foldlMem {β : Type w} : (xs : ρ) → (β → (a : α) → a ∈ xs → β) → β → β
+  foldrEta {β : Type w} {γ : Type x} : (α → (β → γ) → β → γ) → (β → γ) → ρ → β → γ
+  foldrMemEta {β : Type w} {γ : Type x} : (xs : ρ) → ((a : α) → a ∈ xs → (β → γ) → β → γ) → (β → γ) → β → γ
   length : ρ → Nat
 
-@[specialize 3 4] def List.foldrNonTR (f : α → β → β) (init : β) : (l : List α) → β
-  | []     => init
-  | a :: l => f a (foldrNonTR f init l)
+@[specialize 4 5]
+def List.foldrEta (kcons : α → (β → γ) → β → γ) (knil : β → γ) : (l : List α) → (b : β) → γ
+  | []    , b => knil b
+  | a :: l, b => kcons a (foldrEta kcons knil l) b
 
 instance : Foldable (List α) α where
-  foldr := List.foldrNonTR
+  foldr := List.foldr
   foldl := List.foldl
   foldlMem xs f z := List.foldl (fun b ⟨a, h⟩ => f b a h) z xs.attach
   foldrMem xs f z := List.foldr (fun ⟨a, h⟩ b => f a h b) z xs.attach
+  foldrEta := List.foldrEta
+  foldrMemEta xs f z := List.foldrEta (fun ⟨a, h⟩ b => f a h b) z xs.attach
   length := List.length
 
 instance : Foldable (Array α) α where
@@ -52,6 +57,8 @@ instance : Foldable (Array α) α where
   foldl := Array.foldl
   foldlMem xs f z := Array.foldl (fun b ⟨a, h⟩ => f b a h) z xs.attach
   foldrMem xs f z := Array.foldr (fun ⟨a, h⟩ b => f a h b) z xs.attach
+  foldrEta := Array.foldr
+  foldrMemEta xs f z := Array.foldr (fun ⟨a, h⟩ b => f a h b) z xs.attach
   length := Array.size
 
 @[specialize]
@@ -62,13 +69,12 @@ def Foldable.toList [Foldable ρ α] : ρ → List α :=
 def Foldable.foldl' [Foldable ρ α] (f : β → α → β) (init : β) (xs : ρ) : β :=
   foldr (fun a k b => k (f b a)) id xs init
 
-set_option trace.Compiler.saveBase true in
-example := Foldable.foldl' (fun a b => a * b) 1 [1, 2, 3]
-
 class LawfulFoldable (ρ : Type u) (α : outParam (Type v)) [Foldable ρ α] : Prop where
   -- Unsure whether the following law follows by parametricity.
   foldr_eq_foldr_toList (xs : ρ) (k : α → β → β) (z : β) :
     Foldable.foldr k z xs = List.foldr k z (Foldable.toList xs)
+  foldrEta_eq_foldr (xs : ρ) (kcons : α → (β → γ) → β → γ) (knil : β → γ) (z : β) :
+    Foldable.foldrEta kcons knil xs z = Foldable.foldr kcons knil xs z
 
 @[specialize]
 def Foldable.toArray [Foldable ρ α] (xs : ρ) : Array α :=
@@ -86,10 +92,10 @@ def Foldable.foldrTR [Foldable ρ α] (f : α → β → β) (init : β) (xs : �
 
 set_option pp.all true in
 @[inline]
-def Foldable.foldrInv {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type (max v w) → Type x} [Monad m] {σ γ}
+def Foldable.foldrEtaInv {ρ : Type u} {α : Type v} [Foldable ρ α] {m : Type (max v w) → Type x} [Monad m] {σ γ}
     (kcons : α → (σ → m γ) → σ → m γ) (knil : σ → m γ) (xs : ρ) (s : σ)
-    [inst : Foldable ρ α] {ps} [Std.Do.WP m ps] (inv : Std.Do.Invariant (inst.toList xs) σ ps) : m γ :=
-  Foldable.foldr kcons knil xs s
+    [inst : Foldable.{u,v,v,v} ρ α] {ps} [Std.Do.WP m ps] (inv : Std.Do.Invariant (inst.toList xs) σ ps) : m γ :=
+  Foldable.foldrEta kcons knil xs s
 
 declare_syntax_cat dooElem
 
@@ -548,7 +554,8 @@ meta def ContVarId.synthesizeJumps (contVarId : ContVarId) (k : DoElabM Expr) : 
   for jump in info.jumps do
     jump.mvar.mvarId!.withContext do withRef jump.ref do
       let res ← k
-      discard <| isDefEq jump.mvar res
+      unless ← fullApproxDefEq <| isDefEqGuarded jump.mvar res do
+        throwError "Failed to synthesize jump site. {jump.mvar} is not definitionally equal to {res}."
 
 meta def ContVarId.erase (contVarId : ContVarId) : DoElabM Unit := do
   modify fun s => { s with contVars := s.contVars.erase contVarId }
@@ -627,7 +634,7 @@ elaborated once to fill in the RHS of this join point.
 This is useful for control-flow constructs like `if` and `match`, where multiple tail-called
 branches share the continuation.
 -/
-meta def DoElemCont.withDuplicableCont' (nondupDec : DoElemCont) (caller : DoElemCont → ContVarId → DoElabM (LocalContext × Expr)) : DoElabM Expr := do
+meta def DoElemCont.withDuplicableCont (nondupDec : DoElemCont) (caller : DoElemCont → DoElabM Expr) : DoElabM Expr := do
   let α := (← read).doBlockResultType
   let mα ← mkMonadicType α
   let joinTy ← mkFreshExprMVar (mkSort (mkLevelSucc (← read).monadInfo.v)) (userName := `joinTy)
@@ -636,7 +643,7 @@ meta def DoElemCont.withDuplicableCont' (nondupDec : DoElemCont) (caller : DoEle
     let mutVars := (← read).mutVars
     let contVarId ← mkFreshContVar α (mutVars.push nondupDec.resultName)
     let duplicableDec := { nondupDec with k := contVarId.mkJump }
-    let (lctx, e) ← caller duplicableDec contVarId
+    let e ← caller duplicableDec
 
     -- Now determine whether we need to realize the join point.
     let jumpCount ← contVarId.jumpCount
@@ -657,7 +664,7 @@ meta def DoElemCont.withDuplicableCont' (nondupDec : DoElemCont) (caller : DoEle
       -- Compute the union of all reassigned mut vars. These + `r` constitute the parameters
       -- of the join point. We take a little care to preserve the declaration order that is manifest
       -- in the array `(← read).mutVars`.
-      let reassignedMutVars ← contVarId.getReassignedMutVars lctx
+      let reassignedMutVars ← contVarId.getReassignedMutVars (← joinRhs.mvarId!.getDecl).lctx
       let reassignedMutVars := mutVars.filter reassignedMutVars.contains
 
       -- Assign the `joinTy` based on the types of the reassigned mut vars and the result type.
@@ -682,20 +689,6 @@ meta def DoElemCont.withDuplicableCont' (nondupDec : DoElemCont) (caller : DoEle
         return mkApp jump (← Term.ensureHasType resTy r "Mismatched result type for match arm. It")
 
       mkLetFVars #[jp] (generalizeNondepLet := false) (← Term.ensureHasType mα e)
-
-/--
-Call `caller` with a duplicable proxy of `dec`.
-When the proxy is elaborated more than once, a join point is introduced so that `dec` is only
-elaborated once to fill in the RHS of this join point.
-
-This is useful for control-flow constructs like `if` and `match`, where multiple tail-called
-branches share the continuation.
--/
-meta def DoElemCont.withDuplicableCont (nondupDec : DoElemCont) (caller : DoElemCont → ContVarId → DoElabM Expr) : DoElabM Expr := do
-  withDuplicableCont' nondupDec fun duplicableDec contVarId => do
-    let lctx ← getLCtx
-    let e ← caller duplicableDec contVarId
-    return (lctx, e)
 
 /-- Given types `tᵢ`, return the tuple type `t₁ × t₂ × … × tₙ`. -/
 meta def mkProdN (ts : Array Expr) : MetaM Expr := do
@@ -1089,7 +1082,7 @@ mutual
       let rhs ← Term.elabTermEnsuringType rhs xType
       mapLetDecl (usedLetOnly := false) x.getId xType rhs fun _xdefn => dec.continueWithUnit
     | `(dooElem| if $cond then $thenDooSeq $[else $elseDooSeq?]?) =>
-      dec.withDuplicableCont fun dec _ => do
+      dec.withDuplicableCont fun dec => do
         let then_ ← elabElems1 (getDooElems thenDooSeq) dec
         let else_ ← match elseDooSeq? with
           | none => dec.continueWithUnit
@@ -1121,8 +1114,8 @@ mutual
       --   rootCtx := rootCtx.modifyLocalDecl decl.fvarId (·.setNondep true)
       -- withLCtx' rootCtx do
       -- resetCache
-      dec.withDuplicableCont fun dec _breakKVar => do
-      let (kcons, preS, loopMutVars, lctx) ←
+      dec.withDuplicableCont fun dec => do
+      let (kcons, preS, loopMutVars) ←
         withLocalDeclD x.getId α fun x => do
         withLocalDeclD (← mkFreshUserName `kcontinue) β fun kcontinue => do
         withLocalDeclD (← mkFreshUserName `s) σ fun loopS => do
@@ -1130,9 +1123,10 @@ mutual
           let rootCtx ← getLCtx
           let continueKVar ← mkFreshContVar γ mutVars
           let breakKVar ← mkFreshContVar γ mutVars
+          let breakK := eraseProxyDefs dec.continueWithUnit
 
           -- Elaborate the loop body, which must have result type `PUnit`.
-          let body ← enterLoopBody γ (← getReturnCont) breakKVar.mkJump continueKVar.mkJump do
+          let body ← enterLoopBody γ (← getReturnCont) breakK continueKVar.mkJump do
             elabElems1 (getDooElems dooSeq) { dec with k := continueKVar.mkJump }
 
           -- Compute the set of mut vars that were reassigned on the path to a back jump (`continue`).
@@ -1151,10 +1145,6 @@ mutual
           continueKVar.synthesizeJumps do
             let (tuple, _tupleTy) ← mkProdMkN (← loopMutVars.mapM (getFVarFromUserName ·))
             return mkApp kcontinue tuple
-          breakKVar.synthesizeJumps do
-            -- TODO erase the non-reassigned proxy defs from the local context
-            eraseProxyDefs dec.continueWithUnit
-
           let outerCtx ← getLCtx
           let body ← bindMutVarsFromTuple loopMutVars.toList loopS.fvarId! do
             -- Replace the proxy variables with their actual definitions, as if we never introduced
@@ -1168,13 +1158,13 @@ mutual
             -- pure <| body.replaceFVars preDefs loopDefs
             elimProxyDefs body
 
-          return (← mkLambdaFVars #[x, kcontinue, loopS] body, preS, loopMutVars, rootCtx)
+          return (← mkLambdaFVars #[x, kcontinue, loopS] body, preS, loopMutVars)
       let knil ← withLocalDeclD (← mkFreshUserName `s) σ fun postS => do mkLambdaFVars #[postS] <| ← do
         bindMutVarsFromTuple loopMutVars.toList postS.fvarId! do
           dec.continueWithUnit
-      let instFoldable ← Term.mkInstMVar <| mkApp2 (mkConst ``Foldable [uρ, uα, mi.u]) ρ α
-      let app := mkConst ``Foldable.foldr [uρ, uα, mi.u]
-      let app := mkApp8 app ρ α instFoldable β kcons knil xs preS
+      let instFoldable ← Term.mkInstMVar <| mkApp2 (mkConst ``Foldable [uρ, uα, mi.u, mi.v]) ρ α
+      let app := mkConst ``Foldable.foldrEta [uρ, uα, mi.u, mi.v]
+      let app := mkApp9 app ρ α instFoldable σ (← mkMonadicType γ) kcons knil xs preS
       return app
 
       /-
@@ -1257,28 +1247,29 @@ mutual
     | `(dooElem| for $x:ident in $xs invariant $cursorBinder $stateBinders* => $body doo $dooSeq) =>
       --trace[Elab.do] "cursorBinder: {cursorBinder}"
       let call ← elabElem (← `(dooElem| for $x:ident in $xs doo $dooSeq)) dec
-      let_expr Foldable.foldr ρ α instFoldable σmγ kcons knil xs s := call
+      let_expr Foldable.foldrEta ρ α instFoldable σ mγ kcons knil xs s := call
         | throwError "Internal elaboration error: `for` loop did not elaborate to a call of `Foldable.foldr`."
-      let σ ← mkFreshResultType `σ
       let γ ← mkFreshResultType `γ
-      unless ← isDefEqGuarded σmγ (← mkArrow σ (← mkMonadicType γ)) do
-        throwError "The continuation type {σmγ} did not unify with {← mkArrow σ (← mkMonadicType γ)} in {indentExpr call}"
+      unless ← isDefEqGuarded mγ (← mkMonadicType γ) do
+        throwError "The continuation type {mγ} did not unify with {← mkMonadicType γ} in {indentExpr call}"
       call.withApp fun head args => do
-      let [u, v, w] := head.constLevels!
-        | throwError "`Foldable.foldr` had wrong number of levels {head.constLevels!}"
+      let [u, v, w, x] := head.constLevels!
+        | throwError "`Foldable.foldrEta` had wrong number of levels {head.constLevels!}"
       let mi := (← read).monadInfo
-      unless ← isLevelDefEq mi.u w do
-        throwError "The universe level of the monadic result type {mi.u} and that of the state tuple {w} were different. Cannot elaborate invariants for this case."
+      unless ← isLevelDefEq mi.u (mkLevelMax v w) do
+        throwError "The universe level of the monadic result type {mi.u} was not the maximum of that of the state tuple {w} and elements {v}. Cannot elaborate invariants for this case."
+      unless ← isLevelDefEq mi.v x do
+        throwError "The universe level of the result type {mi.v} and that of the continuation result type {x} were different. Cannot elaborate invariants for this case."
       -- First the non-ghost arguments
       let instMonad ← Term.mkInstMVar (mkApp (mkConst ``Monad [mi.u, mi.v]) mi.m)
-      let app := mkConst ``Foldable.foldrInv [u, v, mi.u, mi.v]
+      let app := mkConst ``Foldable.foldrEtaInv [u, v, w, x]
       let app := mkApp7 app ρ α instFoldable mi.m instMonad σ γ
       let app := mkApp4 app kcons knil xs s
       -- Now the ghost arguments
-      let instFoldable ← Term.mkInstMVar (mkApp2 (mkConst ``Foldable [u, v, v]) ρ α)
+      let instFoldable ← Term.mkInstMVar (mkApp2 (mkConst ``Foldable [u, v, v, v]) ρ α)
       let ps ← mkFreshExprMVar (mkConst ``Std.Do.PostShape [mi.u])
       let instWP ← Term.mkInstMVar (mkApp2 (mkConst ``Std.Do.WP [mi.u, mi.v]) (← read).monadInfo.m ps)
-      let xsToList := mkApp4 (mkConst ``Foldable.toList [u, v]) ρ α instFoldable xs
+      let xsToList := mkApp4 (mkConst ``Foldable.toList [u, v, v]) ρ α instFoldable xs
       let inv ← mkFreshExprMVar (mkApp4 (mkConst ``Std.Do.Invariant [v, mi.u]) α xsToList σ ps)
       let cursor := mkApp2 (mkConst ``List.Cursor [v]) α xsToList
       let assertion := mkApp (mkConst ``Std.Do.Assertion [mi.u]) ps
@@ -1407,6 +1398,74 @@ set_option trace.Elab.do true in
   return x
 
 set_option trace.Compiler.saveBase true in
+set_option trace.Compiler.specialize.step true in
+set_option trace.Elab.do true in
+#eval Id.run doo
+  let mut x := 42
+  for i in [1,2,3] doo
+    for j in [i:10].toList doo
+      x := x + i + j
+  return x
+
+@[specialize 3 4] def List.foldrNonTR (f : α → β → β) (init : β) : (l : List α) → β
+  | []     => init
+  | a :: l => f a (foldrNonTR f init l)
+
+set_option trace.Compiler.saveBase true in
+/--
+trace: [Compiler.saveBase] size: 17
+    def Do.List.foldrNonTR._at_.Do._example.spec_0 x.1 _y.2 : Nat :=
+      cases x.1 : Nat
+      | List.nil =>
+        return _y.2
+      | List.cons head.3 tail.4 =>
+        let _x.5 := Do.List.foldrNonTR._at_.Do._example.spec_0 tail.4;
+        fun _f.6 j kcontinue s : Nat :=
+          let _x.7 := Nat.add s head.3;
+          let x := Nat.add _x.7 j;
+          let _x.8 := kcontinue x;
+          return _x.8;
+        let _x.9 := 10;
+        let _x.10 := 1;
+        let _x.11 := Nat.sub _x.9 head.3;
+        let _x.12 := Nat.add _x.11 _x.10;
+        let _x.13 := Nat.sub _x.12 _x.10;
+        let _x.14 := Nat.mul _x.10 _x.13;
+        let _x.15 := Nat.add head.3 _x.14;
+        let _x.16 := @List.nil _;
+        let _x.17 := List.range'TR.go _x.10 _x.13 _x.15 _x.16;
+        let _x.18 := @List.foldrNonTR _ _ _f.6 _x.5 _x.17 _y.2;
+        return _x.18
+[Compiler.saveBase] size: 9
+    def Do._example : Nat :=
+      let x := 42;
+      let _x.1 := 1;
+      let _x.2 := 2;
+      let _x.3 := 3;
+      let _x.4 := @List.nil _;
+      let _x.5 := @List.cons _ _x.3 _x.4;
+      let _x.6 := @List.cons _ _x.2 _x.5;
+      let _x.7 := @List.cons _ _x.1 _x.6;
+      let _x.8 := Do.List.foldrNonTR._at_.Do._example.spec_0 _x.7 x;
+      return _x.8
+-/
+#guard_msgs in
+example :=
+  let x := 42;
+  List.foldrNonTR (β := Nat → Id Nat)
+    (fun i kcontinue s =>
+      let x := s;
+      List.foldrNonTR
+        (fun j kcontinue s =>
+          let x := s;
+          let x := x + i + j;
+          kcontinue x)
+        kcontinue
+        [i:10].toList x)
+    pure
+    [1, 2, 3] x
+
+set_option trace.Compiler.saveBase true in
 set_option trace.Elab.do true in
 #eval Id.run doo
   let mut x := 42
@@ -1423,7 +1482,7 @@ set_option trace.Elab.do true in
 info: (let x := 42;
   let y := 0;
   let z := 1;
-  Foldable.foldr
+  Foldable.foldrEta
     (fun i kcontinue s =>
       let x := s.fst;
       let z := s.snd;
@@ -1462,7 +1521,7 @@ info: (let w := 23;
   let y := 0;
   let z := 1;
   have __do_jp := fun x y z r => pure (w + x + y + z);
-  Foldable.foldr
+  Foldable.foldrEta
     (fun i kcontinue s =>
       let x_1 := s.fst;
       let z := s.snd;
@@ -1503,7 +1562,7 @@ info: (let w := 23;
 set_option trace.Compiler.saveBase true in
 /--
 trace: [Compiler.saveBase] size: 43
-    def List.foldrNonTR._at_.Do._example.spec_0 w x y x.1 _y.2 : Nat :=
+    def List.foldrEta._at_.Do._example.spec_0 w x y x.1 x.2 : Nat :=
       fun _f.3 x y z r.4 : Nat :=
         let _x.5 := Nat.add w x;
         let _x.6 := Nat.add _x.5 y;
@@ -1552,11 +1611,11 @@ trace: [Compiler.saveBase] size: 43
         return _x.34;
       cases x.1 : Nat
       | List.nil =>
-        let _x.35 := _f.31 _y.2;
+        let _x.35 := _f.31 x.2;
         return _x.35
       | List.cons head.36 tail.37 =>
-        let _x.38 := @List.foldrNonTR _ _ _f.8 _f.31 tail.37;
-        let _x.39 := _f.8 head.36 _x.38 _y.2;
+        let _x.38 := @List.foldrEta _ _ _ _f.8 _f.31 tail.37;
+        let _x.39 := _f.8 head.36 _x.38 x.2;
         return _x.39
 [Compiler.saveBase] size: 12
     def Do._example : Nat :=
@@ -1571,7 +1630,7 @@ trace: [Compiler.saveBase] size: 43
       let _x.5 := @List.cons _ _x.1 _x.4;
       let _x.6 := @List.cons _ z _x.5;
       let _x.7 := @Prod.mk _ _ x z;
-      let _x.8 := List.foldrNonTR._at_.Do._example.spec_0 w x y _x.6 _x.7;
+      let _x.8 := List.foldrEta._at_.Do._example.spec_0 w x y _x.6 _x.7;
       return _x.8
 -/
 #guard_msgs in
@@ -1587,13 +1646,12 @@ example := Id.run doo
     x := x + i
   return w + x + y + z
 
--- set_option trace.Compiler.saveBase true in
 set_option trace.Elab.do true in
 /--
 trace: [Elab.do] let x := 42;
     let y := 0;
     have __do_jp := fun x r => pure (x + x + x + x);
-    Foldable.foldr
+    Foldable.foldrEta
       (fun i kcontinue s =>
         let x := s;
         have __do_jp_1 := fun x_1 r =>
@@ -1692,7 +1750,7 @@ trace: [Elab.do] let x := 42;
       let x_3 := x_2 + 13;
       let x := x_3 + 13;
       pure x;
-    Foldable.foldr
+    Foldable.foldrEta
       (fun i kcontinue s =>
         let x := s;
         if x = 3 then pure x
@@ -1713,7 +1771,7 @@ trace: [Elab.do] let x := 42;
       [1, 2, 3] x
 ---
 trace: [Compiler.saveBase] size: 33
-    def List.foldrNonTR._at_.Do._example.spec_0 x.1 _y.2 : Nat :=
+    def List.foldrEta._at_.Do._example.spec_0 x.1 x.2 : Nat :=
       fun _f.3 x r.4 : Nat :=
         let _x.5 := 13;
         let x := Nat.add x _x.5;
@@ -1724,36 +1782,36 @@ trace: [Compiler.saveBase] size: 33
       cases x.1 : Nat
       | List.nil =>
         let _x.6 := PUnit.unit;
-        let _x.7 := _f.3 _y.2 _x.6;
+        let _x.7 := _f.3 x.2 _x.6;
         return _x.7
       | List.cons head.8 tail.9 =>
         let _x.10 := 3;
-        let _x.11 := instDecidableEqNat _y.2 _x.10;
+        let _x.11 := instDecidableEqNat x.2 _x.10;
         cases _x.11 : Nat
         | Decidable.isFalse x.12 =>
           let _x.13 := 10;
-          let _x.14 := Nat.decLt _x.13 _y.2;
+          let _x.14 := Nat.decLt _x.13 x.2;
           cases _x.14 : Nat
           | Decidable.isFalse x.15 =>
             let _x.16 := 20;
-            let _x.17 := Nat.decLt _y.2 _x.16;
+            let _x.17 := Nat.decLt x.2 _x.16;
             cases _x.17 : Nat
             | Decidable.isFalse x.18 =>
-              let x := Nat.add _y.2 head.8;
-              let _x.19 := List.foldrNonTR._at_.Do._example.spec_0 tail.9 x;
+              let x := Nat.add x.2 head.8;
+              let _x.19 := List.foldrEta._at_.Do._example.spec_0 tail.9 x;
               return _x.19
             | Decidable.isTrue x.20 =>
               let _x.21 := 2;
-              let x := Nat.mul _y.2 _x.21;
+              let x := Nat.mul x.2 _x.21;
               let _x.22 := PUnit.unit;
               let _x.23 := _f.3 x _x.22;
               return _x.23
           | Decidable.isTrue x.24 =>
-            let x := Nat.add _y.2 _x.10;
-            let _x.25 := List.foldrNonTR._at_.Do._example.spec_0 tail.9 x;
+            let x := Nat.add x.2 _x.10;
+            let _x.25 := List.foldrEta._at_.Do._example.spec_0 tail.9 x;
             return _x.25
         | Decidable.isTrue x.26 =>
-          return _y.2
+          return x.2
 [Compiler.saveBase] size: 9
     def Do._example : Nat :=
       let x := 42;
@@ -1764,7 +1822,7 @@ trace: [Compiler.saveBase] size: 33
       let _x.5 := @List.cons _ _x.3 _x.4;
       let _x.6 := @List.cons _ _x.2 _x.5;
       let _x.7 := @List.cons _ _x.1 _x.6;
-      let _x.8 := List.foldrNonTR._at_.Do._example.spec_0 _x.7 x;
+      let _x.8 := List.foldrEta._at_.Do._example.spec_0 _x.7 x;
       return _x.8
 -/
 #guard_msgs in
@@ -1784,7 +1842,7 @@ example := Id.run doo
 set_option trace.Compiler.saveBase true in
 /--
 trace: [Compiler.saveBase] size: 33
-    def List.foldrNonTR._at_.Do._example.spec_0 x.1 _y.2 : Nat :=
+    def List.foldrEta._at_.Do._example.spec_0 x.1 x.2 : Nat :=
       fun _f.3 x r.4 : Nat :=
         let _x.5 := 13;
         let x := Nat.add x _x.5;
@@ -1795,36 +1853,36 @@ trace: [Compiler.saveBase] size: 33
       cases x.1 : Nat
       | List.nil =>
         let _x.6 := PUnit.unit;
-        let _x.7 := _f.3 _y.2 _x.6;
+        let _x.7 := _f.3 x.2 _x.6;
         return _x.7
       | List.cons head.8 tail.9 =>
         let _x.10 := 3;
-        let _x.11 := instDecidableEqNat _y.2 _x.10;
+        let _x.11 := instDecidableEqNat x.2 _x.10;
         cases _x.11 : Nat
         | Decidable.isFalse x.12 =>
           let _x.13 := 10;
-          let _x.14 := Nat.decLt _x.13 _y.2;
+          let _x.14 := Nat.decLt _x.13 x.2;
           cases _x.14 : Nat
           | Decidable.isFalse x.15 =>
             let _x.16 := 20;
-            let _x.17 := Nat.decLt _y.2 _x.16;
+            let _x.17 := Nat.decLt x.2 _x.16;
             cases _x.17 : Nat
             | Decidable.isFalse x.18 =>
-              let x := Nat.add _y.2 head.8;
-              let _x.19 := List.foldrNonTR._at_.Do._example.spec_0 tail.9 x;
+              let x := Nat.add x.2 head.8;
+              let _x.19 := List.foldrEta._at_.Do._example.spec_0 tail.9 x;
               return _x.19
             | Decidable.isTrue x.20 =>
               let _x.21 := 2;
-              let x := Nat.mul _y.2 _x.21;
+              let x := Nat.mul x.2 _x.21;
               let _x.22 := PUnit.unit;
               let _x.23 := _f.3 x _x.22;
               return _x.23
           | Decidable.isTrue x.24 =>
-            let x := Nat.add _y.2 _x.10;
-            let _x.25 := List.foldrNonTR._at_.Do._example.spec_0 tail.9 x;
+            let x := Nat.add x.2 _x.10;
+            let _x.25 := List.foldrEta._at_.Do._example.spec_0 tail.9 x;
             return _x.25
         | Decidable.isTrue x.26 =>
-          return _y.2
+          return x.2
 [Compiler.saveBase] size: 9
     def Do._example : Nat :=
       let x := 42;
@@ -1835,7 +1893,7 @@ trace: [Compiler.saveBase] size: 33
       let _x.5 := @List.cons _ _x.3 _x.4;
       let _x.6 := @List.cons _ _x.2 _x.5;
       let _x.7 := @List.cons _ _x.1 _x.6;
-      let _x.8 := List.foldrNonTR._at_.Do._example.spec_0 _x.7 x;
+      let _x.8 := List.foldrEta._at_.Do._example.spec_0 _x.7 x;
       return _x.8
 -/
 #guard_msgs in
@@ -1858,12 +1916,12 @@ set_option trace.Compiler.saveBase true in
 trace: [Elab.do] let x := 42;
     let y := 0;
     let z := 1;
-    Foldable.foldr
+    Foldable.foldrEta
       (fun i kcontinue s =>
         let x := s.fst;
         let z := s.snd;
         let x_1 := x + i;
-        Foldable.foldr
+        Foldable.foldrEta
           (fun j kcontinue_1 s_1 =>
             let z_1 := s_1;
             let z := z_1 + x_1 + j;
@@ -1879,20 +1937,20 @@ trace: [Elab.do] let x := 42;
       [1, 2, 3] (x, z)
 ---
 trace: [Compiler.saveBase] size: 24
-    def List.foldrNonTR._at_.Do._example.spec_0 z x.1 _y.2 : Nat :=
+    def List.foldrEta._at_.Do._example.spec_0 z x.1 x.2 : Nat :=
       cases x.1 : Nat
       | List.nil =>
-        let x := _y.2 # 0;
-        let z := _y.2 # 1;
+        let x := x.2 # 0;
+        let z := x.2 # 1;
         let _x.3 := Nat.add x z;
         return _x.3
       | List.cons head.4 tail.5 =>
-        let x := _y.2 # 0;
-        let z := _y.2 # 1;
+        let x := x.2 # 0;
+        let z := x.2 # 1;
         let x := Nat.add x head.4;
         fun _f.6 s.7 : Nat :=
           let _x.8 := @Prod.mk _ _ x s.7;
-          let _x.9 := List.foldrNonTR._at_.Do._example.spec_0 z tail.5 _x.8;
+          let _x.9 := List.foldrEta._at_.Do._example.spec_0 z tail.5 _x.8;
           return _x.9;
         fun _f.10 j kcontinue.11 s.12 : Nat :=
           let _x.13 := Nat.add s.12 x;
@@ -1908,7 +1966,7 @@ trace: [Compiler.saveBase] size: 24
         let _x.21 := Nat.add head.4 _x.20;
         let _x.22 := @List.nil _;
         let _x.23 := List.range'TR.go z _x.19 _x.21 _x.22;
-        let _x.24 := @List.foldrNonTR _ _ _f.10 _f.6 _x.23 z;
+        let _x.24 := @List.foldrEta _ _ _ _f.10 _f.6 _x.23 z;
         return _x.24
 [Compiler.saveBase] size: 10
     def Do._example : Nat :=
@@ -1921,7 +1979,7 @@ trace: [Compiler.saveBase] size: 24
       let _x.5 := @List.cons _ _x.1 _x.4;
       let _x.6 := @List.cons _ z _x.5;
       let _x.7 := @Prod.mk _ _ x z;
-      let _x.8 := List.foldrNonTR._at_.Do._example.spec_0 z _x.6 _x.7;
+      let _x.8 := List.foldrEta._at_.Do._example.spec_0 z _x.6 _x.7;
       return _x.8
 -/
 #guard_msgs in
@@ -2312,6 +2370,21 @@ example :
   x := x + 13
   return x) := by rfl
 
+set_option trace.Meta.isDefEq true in
+set_option trace.Meta.isDefEq.assign true in
+example := Id.run doo
+  let mut x := 42
+  let mut y := 0
+  let mut z := 1
+  for i in [1,2,3] doo
+    for j in [4,5,6] doo
+      if j < 5 then z := z + j
+      if j < 3 then continue
+      if j > 6 then break
+  return z
+
+-- set_option trace.Meta.synthInstance true in
+set_option trace.Elab.do true in
 -- Test: Nested for loops with break, continue and return
 example :
   (Id.run doo
