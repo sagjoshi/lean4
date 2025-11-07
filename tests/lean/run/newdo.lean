@@ -162,6 +162,20 @@ meta def dooIf := leading_parser withResetCache <| withPositionAfterLinebreak <|
   optional (checkColGe "'else' in 'do' must be indented" >>
     ppDedent ppSpace >> ppRealFill ("else " >> dooSeq))
 
+syntax (name := nestedAction) "<== " term : term
+
+syntax (name := nestedActionFiller) "fill_nested_action " term : term
+syntax (name := nestedActionFillerTactic) "fill_nested_action_tac " term : tactic
+
+@[term_elab nestedAction]
+elab_rules : term <= expectedType?
+  | `(<== $stx) => do
+    logInfo m!"Postponing elaboration of nested action {stx}"
+    -- let e ← Term.mkTacticMVar expectedType? (← `(tactic| fill_nested_action_tac $stx)) .term true
+    let e ← Term.postponeElabTerm (← `(term| fill_nested_action $stx)) expectedType?
+    logInfo m!"Done, {e}"
+    return e
+
 meta def getDooElems (dooSeq : TSyntax `dooSeq) : Array (TSyntax `dooElem) :=
   if dooSeq.raw.getKind == ``dooSeqBracketed then
     dooSeq.raw[1].getArgs.map fun arg => ⟨arg[0]⟩
@@ -476,6 +490,31 @@ meta def elabType (ty? : Option (TSyntax `term)) (freshLevel := false) : DoElabM
   | none => mkFreshExprMVar sort
   | some ty => Term.elabTermEnsuringType ty sort
 
+private partial def withPendingMVars (k : TermElabM α) : TermElabM (α × List MVarId) := do
+  let pendingMVarsSaved := (← get).pendingMVars
+  modify fun s => { s with pendingMVars := [] }
+  try
+    let a ← k
+    let pendingMVars := (← get).pendingMVars
+    return (a, pendingMVars)
+  finally
+    modify fun s => { s with pendingMVars := s.pendingMVars ++ pendingMVarsSaved }
+
+meta def elabTerm (stx : Syntax) (expectedType? : Option Expr) : DoElabM Expr := do
+  let (e, _pendingMVars) ← withPendingMVars <| Term.elabTerm stx expectedType?
+  -- for mvarId in pendingMVars.reverse do
+  --   let some mvarDecl ← Term.getSyntheticMVarDecl? mvarId | continue
+  --   let .postponed _ := mvarDecl.kind | continue
+  --   match mvarDecl.stx with
+  --   | `(<== $e) => logInfo m!"Elaborate {e}"
+  --   | _ => continue
+  return e
+
+meta def elabTermEnsuringType (stx : Syntax) (expectedType? : Option Expr) : DoElabM Expr := do
+  let e ← Term.elabTermEnsuringType stx expectedType?
+  -- nandle nested actions
+  return e
+
 meta def elabBinder (binder : Syntax) (x : Expr → DoElabM α) : DoElabM α := do
   controlAt TermElabM fun runInBase => Term.elabBinder binder (runInBase ∘ x)
 
@@ -559,10 +598,10 @@ meta def ContVarId.synthesizeJumps (contVarId : ContVarId) (k : DoElabM Expr) : 
   for jump in info.jumps do
     withLCtx' jump.lctx do withRef jump.ref do
       let res ← k
-      let mvar := (← instantiateMVars jump.mvar).getAppFn.mvarId!
-      let head := (← instantiateMVars res).getAppFn
-      if head.isMVar then
-        trace[Elab.do] "Assigning jump site {mvar} with {head.mvarId!}"
+--      let mvar := (← instantiateMVars jump.mvar).getAppFn.mvarId!
+--      let head := (← instantiateMVars res).getAppFn
+--      if head.isMVar then
+--        trace[Elab.do] "Assigning jump site {mvar} with {head.mvarId!}"
       fullApproxDefEq <| synthUsingDefEq "jump site" jump.mvar res
 
 meta def ContVarId.erase (contVarId : ContVarId) : DoElabM Unit := do
@@ -939,7 +978,7 @@ structure ControlLifter where
   breakKVar : ContVarId
   continueKVar : ContVarId
   returnCont : DoElemCont
-  hasEarlyReturn : MetaM Bool
+  returns : IO.Ref Bool
   resultType : Expr
 
 meta def ControlLifter.ofCont (dec : DoElemCont) : DoElabM ControlLifter := do
@@ -950,21 +989,28 @@ meta def ControlLifter.ofCont (dec : DoElemCont) : DoElabM ControlLifter := do
   let γ ← mkFreshResultType `γ
   let mutVars := (← read).mutVars
   let pureKVar ← mkFreshContVar γ (mutVars.push dec.resultName)
-  let returnMVar ← mkFreshExprMVar (mkConst ``Unit)
+  let returns ← IO.mkRef false
   let breakKVar ← mkFreshContVar γ mutVars
   let continueKVar ← mkFreshContVar γ mutVars
   let ρ := oldReturnCont.resultType
   let instMonad ← Term.mkInstMVar (mkApp (mkConst ``Monad [mi.u, mi.v]) mi.m)
   -- We can fill in `returnK` immediately because it does not influence reassigned mut vars
   let returnCont := { oldReturnCont with k := do
-    -- The following line is purely so that we know whether there was an early return at all
-    discard <| isDefEq returnMVar (mkConst ``Unit.unit)
+    returns.set true
     let r ← getFVarFromUserName oldReturnCont.resultName
-    -- TODO: Can we construct γ later on? It must be stM of the transformer stack above
-    -- `EarlyReturnT`.
     return mkApp5 (mkConst ``EarlyReturnT.return [mi.u, mi.v]) ρ mi.m (← mkFreshResultType `δ) instMonad r }
-  let hasEarlyReturn := returnMVar.mvarId!.isAssigned
-  return { mutVars, monadInfo := mi, instMonad, successCont := dec, pureKVar, breakKVar, continueKVar, returnCont, hasEarlyReturn, resultType := γ }
+  return {
+    mutVars,
+    monadInfo := mi,
+    instMonad,
+    successCont := dec,
+    pureKVar,
+    breakKVar,
+    continueKVar,
+    returnCont,
+    returns,
+    resultType := γ
+  }
 
 meta def ControlLifter.lift (l : ControlLifter) (elabElem : DoElemElab) : DoElabM Expr := do
   let oldBreakCont ← getBreakCont
@@ -985,7 +1031,7 @@ meta def ControlLifter.synthesizeConts (l : ControlLifter) (breakT? : Option Boo
     pure <| l.mutVars.filter (pur.union brk |>.union cnt).contains
   let breakT := breakT? = some true || (← l.breakKVar.jumpCount) > 0 || (← l.continueKVar.jumpCount) > 0
   let stateT := stateT? = some true || (reassignedMutVars.size > 0)
-  let earlyReturnT := earlyReturnT? = some true || (← l.hasEarlyReturn)
+  let earlyReturnT := earlyReturnT? = some true || (← l.returns.get)
   let mut controlStack := ControlStack.base l.monadInfo l.instMonad
   if earlyReturnT then
     controlStack := ControlStack.earlyReturnT l.returnCont.resultType controlStack
@@ -1016,9 +1062,6 @@ meta def withProxyMutVarDefs [Inhabited α] (k : (Expr → MetaM Expr) → DoEla
   let mutVars := (← read).mutVars
   let outerCtx ← getLCtx
   let outerDecls := mutVars.map outerCtx.getFromUserName!
-  -- for decl in outerDecls do
-  --   outerCtx := outerCtx.addDecl (decl.setNondep true)
-  -- withLCtx' outerCtx do
   withLocalDeclsDND (← outerDecls.mapM fun x => do return (x.userName, x.type)) (kind := .implDetail) fun proxyDefs => do
     let proxyCtx ← getLCtx
     let elimProxyDefs e : MetaM Expr := do
@@ -1041,7 +1084,7 @@ mutual
     -- First off the three constructs that discard the continuation `k`:
     | `(dooElem| return $e) =>
       let returnCont ← getReturnCont
-      let e ← Term.elabTermEnsuringType e returnCont.resultType
+      let e ← elabTermEnsuringType e returnCont.resultType
       mapLetDeclZeta returnCont.resultName returnCont.resultType e fun _ =>
         returnCont.k
     | `(dooElem| break) =>
@@ -1055,7 +1098,7 @@ mutual
       continueCont
     | `(dooElem| $e:term) =>
       let mα ← mkMonadicType dec.resultType
-      let e ← Term.elabTermEnsuringType e mα
+      let e ← elabTermEnsuringType e mα
       dec.mkBindUnlessPure e
     | `(dooElem| let $[mut%$mutTk?]? $x:ident $[: $xType?]? ← $rhs) =>
       checkMutVarsForShadowing x.getId
@@ -1079,12 +1122,12 @@ mutual
       -- foo has sort `Sort 0`, whereas the sort of the monadic result type `Nat` is `Sort 1`.
       -- Hence `freshLevel := true` (yes, even for `mut` vars; why not?).
       let xType ← elabType xType? (freshLevel := true)
-      let rhs ← Term.elabTermEnsuringType rhs xType
+      let rhs ← elabTermEnsuringType rhs xType
       mapLetDecl (usedLetOnly := false) x.getId xType rhs fun _xdefn => declareMutVar? mutTk? x.getId dec.continueWithUnit
     | `(dooElem| $x:ident := $rhs) =>
       throwUnlessMutVarDeclared x.getId
       let xType := (← getLocalDeclFromUserName x.getId).type
-      let rhs ← Term.elabTermEnsuringType rhs xType
+      let rhs ← elabTermEnsuringType rhs xType
       mapLetDecl (usedLetOnly := false) x.getId xType rhs fun _xdefn => dec.continueWithUnit
     | `(dooElem| if $cond then $thenDooSeq $[else $elseDooSeq?]?) =>
       dec.withDuplicableCont fun dec => do
@@ -1094,7 +1137,7 @@ mutual
           | some elseDooSeq => elabElems1 (getDooElems elseDooSeq) dec
         let then_ ← Term.exprToSyntax then_
         let else_ ← Term.exprToSyntax else_
-        Term.elabTerm (← `(if $cond then $then_ else $else_)) none
+        elabTerm (← `(if $cond then $then_ else $else_)) none
     | `(dooElem| doo $dooSeq) => elabElems1 (getDooElems dooSeq) dec
     | `(dooElem| for $x:ident in $xs doo $dooSeq) =>
       -- set_option pp.universes true in #print forBreakMem_
@@ -1102,7 +1145,7 @@ mutual
       let uρ ← mkFreshLevelMVar
       let α ← mkFreshExprMVar (mkSort (mkLevelSucc uα)) (userName := `α)
       let ρ ← mkFreshExprMVar (mkSort (mkLevelSucc uρ)) (userName := `ρ)
-      let xs ← Term.elabTermEnsuringType xs ρ
+      let xs ← elabTermEnsuringType xs ρ
       let mi := (← read).monadInfo
       let instMonad ← Term.mkInstMVar (mkApp (mkConst ``Monad [mi.u, mi.v]) mi.m)
       let σ ← mkFreshExprMVar (mkSort (mkLevelSucc mi.u)) (userName := `σ)
@@ -1276,6 +1319,10 @@ meta def elabDooBlock (dooSeq : TSyntax `dooSeq) (expectedType? : Expr) : TermEl
 elab_rules : term <= expectedType?
   | `(dooBlock| doo $dooSeq) => elabDooBlock dooSeq expectedType?
 
+set_option trace.Elab.step true in
+set_option trace.Elab.step.result true in
+#check Id.run (α := Nat) doo return (<== pure 13) + 3
+
 set_option trace.Elab.do true in
 set_option pp.raw false in
 #check Id.run (α := Nat) doo
@@ -1337,18 +1384,39 @@ set_option trace.Elab.do true in
   return x
 
 set_option trace.Elab.do true in
-set_option trace.Meta.isDefEq true in
-set_option trace.Meta.isDefEq.assign true in
+/--
+trace: [Elab.do] let x := 1;
+    have kbreak := fun s =>
+      let x := s;
+      pure x;
+    Foldable.foldrEta
+      (fun i kcontinue s =>
+        let x := s;
+        have kbreak_1 := fun s_1 =>
+          let x_1 := s_1;
+          if x_1 > 20 then kbreak x_1 else kcontinue x_1;
+        Foldable.foldrEta
+          (fun j kcontinue_1 s_1 =>
+            let x_1 := s_1;
+            have __do_jp := fun x_2 r =>
+              if j < 3 then kcontinue_1 x_2 else if j > 6 then kbreak_1 x_2 else kcontinue_1 x_2;
+            if j < 5 then
+              let x := x_1 + j;
+              __do_jp x PUnit.unit
+            else __do_jp x_1 PUnit.unit)
+          kbreak_1 [4, 5, 6] x)
+      kbreak [1, 2, 3] x
+-/
+#guard_msgs in
 example := Id.run doo
-  let mut x := 42
-  let mut y := 0
-  let mut z := 1
+  let mut x := 1
   for i in [1,2,3] doo
     for j in [4,5,6] doo
-      if j < 5 then z := z + j
+      if j < 5 then x := x + j
       if j < 3 then continue
       if j > 6 then break
-  return z
+    if x > 20 then break
+  return x
 
 set_option trace.Compiler.saveBase true in
 set_option trace.Elab.do true in
@@ -2524,3 +2592,45 @@ else
   else
     x := x + 5
   return x + y
+
+
+set_option trace.Elab.do true in
+/--
+trace: [Elab.do] let x := 42;
+    have kbreak := fun s =>
+      let x := s;
+      let x := x + 13;
+      let x := x + 13;
+      let x := x + 13;
+      let x := x + 13;
+      pure x;
+    Foldable.foldrEta
+      (fun i kcontinue s =>
+        let x := s;
+        if x = 3 then pure x
+        else
+          if x > 10 then
+            let x := x + 3;
+            kcontinue x
+          else
+            if x < 20 then
+              let x := x * 2;
+              kbreak x
+            else
+              let x := x + i;
+              kcontinue x)
+      kbreak [1, 2, 3] x
+-/
+#guard_msgs in
+example := Id.run doo
+  let mut x := 42
+  for i in [1,2,3] doo
+    if x = 3 then return x
+    if x > 10 then x := x + 3; continue
+    if x < 20 then x := x * 2; break
+    x := x + i
+  x := x + 13
+  x := x + 13
+  x := x + 13
+  x := x + 13
+  return x
