@@ -1785,28 +1785,29 @@ partial def withLocalDecls
     [Inhabited α]
     (declInfos : Array (Name × BinderInfo × (Array Expr → n Expr)))
     (k : (xs : Array Expr) → n α)
+    (kind : LocalDeclKind := .default)
     : n α :=
   loop #[]
 where
   loop [Inhabited α] (acc : Array Expr) : n α := do
     if acc.size < declInfos.size then
       let (name, bi, typeCtor) := declInfos[acc.size]!
-      withLocalDecl name bi (←typeCtor acc) fun x => loop (acc.push x)
+      withLocalDecl name bi (←typeCtor acc) (fun x => loop (acc.push x)) kind
     else
       k acc
 
 /--
 Variant of `withLocalDecls` using `BinderInfo.default`
 -/
-def withLocalDeclsD [Inhabited α] (declInfos : Array (Name × (Array Expr → n Expr))) (k : (xs : Array Expr) → n α) : n α :=
+def withLocalDeclsD [Inhabited α] (declInfos : Array (Name × (Array Expr → n Expr))) (k : (xs : Array Expr) → n α) (kind : LocalDeclKind := .default) : n α :=
   withLocalDecls
-    (declInfos.map (fun (name, typeCtor) => (name, BinderInfo.default, typeCtor))) k
+    (declInfos.map (fun (name, typeCtor) => (name, BinderInfo.default, typeCtor))) k kind
 
 /--
 Simpler variant of `withLocalDeclsD` for bringing variables into scope whose types do not depend
 on each other.
 -/
-def withLocalDeclsDND [Inhabited α] (declInfos : Array (Name × Expr)) (k : (xs : Array Expr) → n α) : n α :=
+def withLocalDeclsDND [Inhabited α] (declInfos : Array (Name × Expr)) (k : (xs : Array Expr) → n α) (kind : LocalDeclKind := .default): n α :=
   withLocalDeclsD
     (declInfos.map (fun (name, typeCtor) => (name, fun _ => pure typeCtor))) k
 

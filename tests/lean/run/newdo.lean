@@ -1019,7 +1019,7 @@ meta def withProxyMutVarDefs [Inhabited α] (k : (Expr → MetaM Expr) → DoEla
   -- for decl in outerDecls do
   --   outerCtx := outerCtx.addDecl (decl.setNondep true)
   -- withLCtx' outerCtx do
-  withLocalDeclsDND (← outerDecls.mapM fun x => do return (x.userName, x.type)) fun proxyDefs => do
+  withLocalDeclsDND (← outerDecls.mapM fun x => do return (x.userName, x.type)) (kind := .implDetail) fun proxyDefs => do
     let proxyCtx ← getLCtx
     let elimProxyDefs e : MetaM Expr := do
       let innerCtx ← getLCtx
@@ -1163,15 +1163,16 @@ mutual
         let body ← bindMutVarsFromTuple loopMutVars.toList loopS.fvarId! do
           elimProxyDefs body
 
+        let hadBreak := (← breakKVar.jumpCount) > 0
         let kcons ← mkLambdaFVars #[x, kcontinue, loopS] body
-        let knil := if (← breakKVar.jumpCount) > 0 then kbreak else breakRhs
+        let knil := if hadBreak then kbreak else breakRhs
         let instFoldable ← Term.mkInstMVar <| mkApp2 (mkConst ``Foldable [uρ, uα, mi.u, mi.v]) ρ α
         let app := mkConst ``Foldable.foldrEta [uρ, uα, mi.u, mi.v]
         let app := mkApp9 app ρ α instFoldable σ (← mkMonadicType γ) kcons knil xs preS
-        if (← breakKVar.jumpCount) > 0 then
+        if hadBreak then
           mkLetFVars (generalizeNondepLet := false) #[kbreak] app
         else
-          elimMVarDeps #[breakRhs] app
+          return (← elimMVarDeps #[kbreak] app).replaceFVar kbreak breakRhs
 
     | `(dooElem| for $x:ident in $xs invariant $cursorBinder $stateBinders* => $body doo $dooSeq) =>
       --trace[Elab.do] "cursorBinder: {cursorBinder}"
@@ -2504,7 +2505,7 @@ else
 /--
 info: let x := 0;
 let y := 0;
-let __do_jp := fun x r => pure (x + y);
+have __do_jp := fun x r => pure (x + y);
 if true = true then
   let x := x + 7;
   let y := 3;
